@@ -7,6 +7,7 @@ import pandas as pd
 
 
 DATASET_PATH = Path('dataset')
+FULL_DATASET = DATASET_PATH / Path('farmyard.csv')
 
 
 def dataset_info() -> Dict[str, int]:
@@ -59,21 +60,13 @@ def create_dataset_metadata():
                     })
 
         dataset_df = pd.DataFrame(dataset)
-        dataset_df.to_csv("dataset/farmyard.csv")
+        dataset_df.to_csv(FULL_DATASET)
         return dataset_df
     except Exception as e:
         raise RuntimeError(f"error: {e}")
 
 """
 def dataset_statistics(dt: pd.DataFrame) -> pd.DataFrame:
-    pass
-
-
-def standardize_format(audio: torch.tensor) -> torch.tensor:
-    pass
-
-
-def frame_audio(audio: torch.tensor) -> torch.tensor:
     pass
 """
 
