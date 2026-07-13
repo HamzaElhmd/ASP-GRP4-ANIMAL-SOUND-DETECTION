@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Downloads a YouTube video's audio (mono, 16kHz WAV) and splits it into
-# fixed-length chunks for the multi-label co-occurrence EDA (Step 3).
+# fixed-length chunks for the multi-label co-occurrence EDA.
 #
 # Usage:
 #   scripts/fetch_multilabel_audio.sh <youtube_url> [segment_seconds]

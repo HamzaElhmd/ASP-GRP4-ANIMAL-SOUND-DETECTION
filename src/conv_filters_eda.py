@@ -23,7 +23,7 @@ except ModuleNotFoundError:
         sample_frames_per_class,
     )
 
-OUTPUT_DIR = Path("eda_outputs/step4_conv_filters")
+OUTPUT_DIR = Path("eda_outputs/conv_filters")
 
 SOBEL_X = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]])
 SOBEL_Y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]])

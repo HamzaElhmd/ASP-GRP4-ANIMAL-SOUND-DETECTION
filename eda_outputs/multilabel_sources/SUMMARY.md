@@ -1,4 +1,4 @@
-## Step 3 -- Multi-label / co-occurrence EDA
+## Multi-label / co-occurrence EDA
 
 ### Source
 

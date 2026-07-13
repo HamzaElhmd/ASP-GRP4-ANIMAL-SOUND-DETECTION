@@ -1,4 +1,4 @@
-# Listening commands for Step 3 (multi-label co-occurrence EDA)
+# Listening commands for multi-label co-occurrence EDA
 
 Run these one at a time in Terminal, from the project root:
 ```bash
