@@ -1,7 +1,7 @@
-torchaudio
-torchcodec
-torch
-pandas
-numpy<2
-matplotlib
-scikit-learn
+torch==2.2.2
+torchaudio==2.2.2
+torchcodec==0.0.0.dev0
+pandas==2.3.3
+numpy==1.26.4
+matplotlib==3.9.4
+scikit-learn==1.6.1
