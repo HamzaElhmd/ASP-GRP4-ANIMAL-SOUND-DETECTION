@@ -68,7 +68,7 @@ def _delta_torch(features: torch.Tensor, width: int = 2) -> torch.Tensor:
     if features.shape[0] == 1:
         return torch.zeros_like(features)
     denom = 2 * sum(i * i for i in range(1, width + 1))
-    padded = torch.nn.functional.pad(features, (0, 0, width, width), mode="replicate")
+    padded = torch.cat([features[:1].repeat(width, 1), features, features[-1:].repeat(width, 1)], dim=0)
     out = torch.zeros_like(features)
     for t in range(features.shape[0]):
         acc = torch.zeros(features.shape[1], device=features.device, dtype=features.dtype)
