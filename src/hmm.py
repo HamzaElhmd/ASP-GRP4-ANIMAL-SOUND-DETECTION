@@ -352,12 +352,14 @@ def _group_by_recording(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
 
 
 def _load_sequences(df: pd.DataFrame) -> List[np.ndarray]:
-    sequences = []
-    for _, row in df.iterrows():
+    def _extract_row(row: pd.Series) -> np.ndarray:
         audio, sr = _load_audio(Path(row["filepath"]), TARGET_SR)
-        features = extract_mfcc_features(audio, sr=sr)
-        sequences.append(features)
-    return sequences
+        return extract_mfcc_features(audio, sr=sr)
+
+    rows = [row for _, row in df.iterrows()]
+    if not rows:
+        return []
+    return Parallel(n_jobs=-1, prefer="threads")(delayed(_extract_row)(row) for row in rows)
 
 
 def _fit_scaler(sequences: Sequence[np.ndarray]) -> StandardScaler:
@@ -410,7 +412,7 @@ def _score_one_label(
         feats = scaler.transform(extract_mfcc_features(audio, sr)).astype(np.float32)
         gamma, _, _ = model._forward_backward(feats)
         active = temporal_postprocess(gamma[:, ACTIVE_STATE])
-        pred_segments = _binary_event_segments(active, hop_seconds=FEATURE_HOP_SECONDS)
+        pred_segments = _binary_event_segments(active, FEATURE_HOP_SECONDS)
         gt_duration = len(active) * FEATURE_HOP_SECONDS
         truths.append((0.0, gt_duration))
         preds.extend(pred_segments)
