@@ -14,6 +14,7 @@ import pandas as pd
 from scipy.fft import dct
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.preprocessing import StandardScaler
+from joblib import Parallel, delayed
 
 try:
     import torchaudio
@@ -369,6 +370,70 @@ def _transform_sequences(sequences: Sequence[np.ndarray], scaler: StandardScaler
     return [scaler.transform(seq).astype(np.float32) for seq in sequences]
 
 
+def _train_one_label(
+    label: str,
+    train_sequences: Sequence[np.ndarray],
+    val_sequences: Sequence[np.ndarray],
+    test_sequences: Sequence[np.ndarray],
+    scaler: StandardScaler,
+    config: BinaryHMMConfig,
+    output_dir: Path,
+) -> Tuple[str, Dict[str, Optional[float]]]:
+    train_seq = _transform_sequences(train_sequences, scaler)
+    val_seq = _transform_sequences(val_sequences, scaler)
+    test_seq = _transform_sequences(test_sequences, scaler)
+
+    model = BinaryGMMHMM(config).fit(train_seq)
+    joblib.dump(model, output_dir / f"{label}_hmm.joblib")
+
+    val_scores = [model.score(seq) for seq in val_seq] if val_seq else []
+    test_scores = [model.score(seq) for seq in test_seq] if test_seq else []
+    return label, {
+        "validation_log_likelihood_mean": float(np.mean(val_scores)) if val_scores else None,
+        "test_log_likelihood_mean": float(np.mean(test_scores)) if test_scores else None,
+    }
+
+
+def _score_one_label(
+    label: str,
+    rows: pd.DataFrame,
+    scaler: StandardScaler,
+    model: BinaryGMMHMM,
+    collar_seconds: float,
+) -> Tuple[str, Dict[str, object]]:
+    truths = []
+    preds = []
+    frame_truth = []
+    frame_pred = []
+    for _, row in rows.iterrows():
+        audio, sr = _load_audio(Path(row["filepath"]), TARGET_SR)
+        feats = scaler.transform(extract_mfcc_features(audio, sr)).astype(np.float32)
+        gamma, _, _ = model._forward_backward(feats)
+        active = temporal_postprocess(gamma[:, ACTIVE_STATE])
+        pred_segments = _binary_event_segments(active, hop_seconds=FEATURE_HOP_SECONDS)
+        gt_duration = len(active) * FEATURE_HOP_SECONDS
+        truths.append((0.0, gt_duration))
+        preds.extend(pred_segments)
+        frame_truth.extend([1] * len(active))
+        frame_pred.extend(active.tolist())
+    return label, {
+        "frame_based": frame_based_scores(np.array(frame_truth), np.array(frame_pred)),
+        "event_based": event_based_scores(truths, preds, collar=collar_seconds),
+        "num_test_files": int(len(rows)),
+        "num_predicted_events": int(len(preds)),
+        "num_truth_events": int(len(truths)),
+    }
+
+
+def _score_model_window(
+    label: str,
+    model: BinaryGMMHMM,
+    features: np.ndarray,
+) -> Tuple[str, np.ndarray]:
+    gamma, _, _ = model._forward_backward(features)
+    return label, gamma[:, ACTIVE_STATE]
+
+
 def _binary_event_segments(states: np.ndarray, frame_hop_seconds: float) -> List[Tuple[float, float]]:
     segments = []
     active = False
@@ -473,20 +538,19 @@ def train_hmm_suite(
     joblib.dump(scaler, output_dir / "feature_scaler.joblib")
 
     metrics = {"splits": {"train": len(train_df), "val": len(val_df), "test": len(test_df)}, "classes": {}}
-    for label in CLASSES:
-        train_seq = _transform_sequences(train_sequences_by_label[label], scaler)
-        val_seq = _transform_sequences(val_sequences_by_label[label], scaler)
-        test_seq = _transform_sequences(test_sequences_by_label[label], scaler)
-
-        model = BinaryGMMHMM(config).fit(train_seq)
-        joblib.dump(model, output_dir / f"{label}_hmm.joblib")
-
-        val_scores = [model.score(seq) for seq in val_seq] if val_seq else []
-        test_scores = [model.score(seq) for seq in test_seq] if test_seq else []
-        metrics["classes"][label] = {
-            "validation_log_likelihood_mean": float(np.mean(val_scores)) if val_scores else None,
-            "test_log_likelihood_mean": float(np.mean(test_scores)) if test_scores else None,
-        }
+    trained = Parallel(n_jobs=-1, prefer="threads")(
+        delayed(_train_one_label)(
+            label,
+            train_sequences_by_label[label],
+            val_sequences_by_label[label],
+            test_sequences_by_label[label],
+            scaler,
+            config,
+            output_dir,
+        )
+        for label in CLASSES
+    )
+    metrics["classes"] = {label: values for label, values in trained}
 
     metrics_path = output_dir / "training_diagnostics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2))
@@ -522,9 +586,11 @@ def infer_continuous_file(
         clip = frames[w_idx]
         features = scaler.transform(extract_mfcc_features(clip.astype(np.float32), sr)).astype(np.float32)
         frame_offset = int(round((w_idx * INFERENCE_HOP_SECONDS) / hop_seconds))
-        for label, model in models.items():
-            gamma, _, _ = model._forward_backward(features)
-            active = gamma[:, ACTIVE_STATE]
+        results = Parallel(n_jobs=-1, prefer="threads")(
+            delayed(_score_model_window)(label, model, features)
+            for label, model in models.items()
+        )
+        for label, active in results:
             end_frame = min(frame_offset + len(active), total_frames)
             if end_frame > frame_offset:
                 probs[label][frame_offset:end_frame] = np.maximum(
@@ -558,30 +624,18 @@ def evaluate_suite(
     scaler: StandardScaler = joblib.load(model_dir / "feature_scaler.joblib")
     models = {label: joblib.load(model_dir / f"{label}_hmm.joblib") for label in CLASSES}
 
+    scored = Parallel(n_jobs=-1, prefer="threads")(
+        delayed(_score_one_label)(label, test_df[test_df["label"] == label], scaler, models[label], collar_seconds)
+        for label in CLASSES
+    )
     diagnostics = {"frame_based": {}, "event_based": {}, "per_class": {}}
-    for label in CLASSES:
-        rows = test_df[test_df["label"] == label]
-        truths = []
-        preds = []
-        frame_truth = []
-        frame_pred = []
-        for _, row in rows.iterrows():
-            audio, sr = _load_audio(Path(row["filepath"]), TARGET_SR)
-            feats = scaler.transform(extract_mfcc_features(audio, sr)).astype(np.float32)
-            gamma, _, _ = models[label]._forward_backward(feats)
-            active = temporal_postprocess(gamma[:, ACTIVE_STATE])
-            pred_segments = _binary_event_segments(active, hop_seconds=FEATURE_HOP_SECONDS)
-            gt_duration = len(active) * FEATURE_HOP_SECONDS
-            truths.append((0.0, gt_duration))
-            preds.extend(pred_segments)
-            frame_truth.extend([1] * len(active))
-            frame_pred.extend(active.tolist())
-        diagnostics["frame_based"][label] = frame_based_scores(np.array(frame_truth), np.array(frame_pred))
-        diagnostics["event_based"][label] = event_based_scores(truths, preds, collar=collar_seconds)
+    for label, values in scored:
+        diagnostics["frame_based"][label] = values["frame_based"]
+        diagnostics["event_based"][label] = values["event_based"]
         diagnostics["per_class"][label] = {
-            "num_test_files": int(len(rows)),
-            "num_predicted_events": int(len(preds)),
-            "num_truth_events": int(len(truths)),
+            "num_test_files": values["num_test_files"],
+            "num_predicted_events": values["num_predicted_events"],
+            "num_truth_events": values["num_truth_events"],
         }
     output_json.parent.mkdir(parents=True, exist_ok=True)
     output_json.write_text(json.dumps(diagnostics, indent=2))
