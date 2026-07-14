@@ -197,7 +197,7 @@ def recording_level_split(
 class BinaryHMMConfig:
     n_states: int = 2
     n_components: int = 2
-    n_iter: int = 25
+    n_iter: int = 8
     tol: float = 1e-3
     covariance_floor: float = 1e-3
     random_state: int = 13
@@ -208,141 +208,137 @@ class BinaryGMMHMM:
         self.config = config
         self.n_states = config.n_states
         self.n_components = config.n_components
+        self.device = DEFAULT_DEVICE
         self.random_state = np.random.default_rng(config.random_state)
-        self.startprob_ = np.array([0.95, 0.05], dtype=np.float64)
-        self.transmat_ = np.array([[0.97, 0.03], [0.08, 0.92]], dtype=np.float64)
+        self.startprob_ = torch.tensor([0.95, 0.05], dtype=torch.float32, device=self.device)
+        self.transmat_ = torch.tensor([[0.97, 0.03], [0.08, 0.92]], dtype=torch.float32, device=self.device)
         self.weights_ = None
         self.means_ = None
         self.covars_ = None
 
-    def _log_gaussian(self, X: np.ndarray, mean: np.ndarray, cov: np.ndarray) -> np.ndarray:
-        cov = np.maximum(cov, self.config.covariance_floor)
+    def _log_gaussian(self, X: torch.Tensor, mean: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
+        cov = torch.clamp(cov, min=self.config.covariance_floor)
         diff = X - mean
         return -0.5 * (
-            np.sum(np.log(2.0 * np.pi * cov))
-            + np.sum((diff * diff) / cov, axis=1)
+            torch.log(2.0 * torch.pi * cov).sum(dim=-1)
+            + (diff * diff / cov).sum(dim=-1)
         )
 
-    def _log_mix_emission(self, X: np.ndarray) -> np.ndarray:
-        n_samples, n_features = X.shape
-        log_prob = np.zeros((n_samples, self.n_states), dtype=np.float64)
+    def _log_mix_emission(self, X: torch.Tensor) -> torch.Tensor:
+        log_prob = []
         for s in range(self.n_states):
-            comp = []
+            comps = []
             for k in range(self.n_components):
-                lp = self._log_gaussian(X, self.means_[s, k], self.covars_[s, k]) + np.log(self.weights_[s, k] + EPS)
-                comp.append(lp)
-            comp = np.vstack(comp)
-            max_lp = np.max(comp, axis=0)
-            log_prob[:, s] = max_lp + np.log(np.sum(np.exp(comp - max_lp), axis=0) + EPS)
-        return log_prob
+                lp = self._log_gaussian(X, self.means_[s, k], self.covars_[s, k]) + torch.log(self.weights_[s, k] + EPS)
+                comps.append(lp)
+            comp = torch.stack(comps, dim=0)
+            log_prob.append(torch.logsumexp(comp, dim=0))
+        return torch.stack(log_prob, dim=1)
 
-    def _forward_backward(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    def _forward_backward(self, X: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
         log_emit = self._log_mix_emission(X)
-        log_start = np.log(self.startprob_ + EPS)
-        log_trans = np.log(self.transmat_ + EPS)
+        log_start = torch.log(self.startprob_ + EPS)
+        log_trans = torch.log(self.transmat_ + EPS)
         T = X.shape[0]
-        alpha = np.zeros((T, self.n_states), dtype=np.float64)
-        scale = np.zeros(T, dtype=np.float64)
+        alpha = torch.empty((T, self.n_states), device=self.device, dtype=torch.float32)
+        scale = torch.empty(T, device=self.device, dtype=torch.float32)
         alpha[0] = log_start + log_emit[0]
-        scale[0] = np.logaddexp.reduce(alpha[0])
+        scale[0] = torch.logsumexp(alpha[0], dim=0)
         alpha[0] -= scale[0]
         for t in range(1, T):
-            for j in range(self.n_states):
-                alpha[t, j] = np.logaddexp.reduce(alpha[t - 1] + log_trans[:, j]) + log_emit[t, j]
-            scale[t] = np.logaddexp.reduce(alpha[t])
+            alpha[t] = torch.logsumexp(alpha[t - 1].unsqueeze(1) + log_trans, dim=0) + log_emit[t]
+            scale[t] = torch.logsumexp(alpha[t], dim=0)
             alpha[t] -= scale[t]
-        beta = np.zeros((T, self.n_states), dtype=np.float64)
+        beta = torch.zeros((T, self.n_states), device=self.device, dtype=torch.float32)
         for t in range(T - 2, -1, -1):
-            for i in range(self.n_states):
-                beta[t, i] = np.logaddexp.reduce(log_trans[i] + log_emit[t + 1] + beta[t + 1]) - scale[t + 1]
-        gamma = np.exp(alpha + beta)
-        gamma /= np.maximum(gamma.sum(axis=1, keepdims=True), EPS)
-        xi = np.zeros((T - 1, self.n_states, self.n_states), dtype=np.float64)
+            beta[t] = torch.logsumexp(log_trans + log_emit[t + 1].unsqueeze(0) + beta[t + 1].unsqueeze(0), dim=1) - scale[t + 1]
+        gamma = torch.exp(alpha + beta)
+        gamma = gamma / torch.clamp(gamma.sum(dim=1, keepdim=True), min=EPS)
+        xi = torch.empty((T - 1, self.n_states, self.n_states), device=self.device, dtype=torch.float32)
         for t in range(T - 1):
-            m = (
-                alpha[t][:, None]
-                + log_trans
-                + log_emit[t + 1][None, :]
-                + beta[t + 1][None, :]
-            )
-            m -= np.logaddexp.reduce(m.ravel())
-            xi[t] = np.exp(m)
-        return gamma, xi, float(np.sum(scale))
+            m = alpha[t].unsqueeze(1) + log_trans + log_emit[t + 1].unsqueeze(0) + beta[t + 1].unsqueeze(0)
+            m = m - torch.logsumexp(m.reshape(-1), dim=0)
+            xi[t] = torch.exp(m)
+        return gamma, xi, float(scale.sum().item())
 
-    def _init_params(self, X: np.ndarray) -> None:
+    def _init_params(self, X: torch.Tensor) -> None:
         n_features = X.shape[1]
-        self.weights_ = np.full((self.n_states, self.n_components), 1.0 / self.n_components, dtype=np.float64)
-        self.means_ = np.zeros((self.n_states, self.n_components, n_features), dtype=np.float64)
-        self.covars_ = np.zeros((self.n_states, self.n_components, n_features), dtype=np.float64)
-        overall_mean = X.mean(axis=0)
-        overall_var = X.var(axis=0) + self.config.covariance_floor
+        self.weights_ = torch.full((self.n_states, self.n_components), 1.0 / self.n_components, dtype=torch.float32, device=self.device)
+        self.means_ = torch.zeros((self.n_states, self.n_components, n_features), dtype=torch.float32, device=self.device)
+        self.covars_ = torch.zeros((self.n_states, self.n_components, n_features), dtype=torch.float32, device=self.device)
+        overall_mean = X.mean(dim=0)
+        overall_var = X.var(dim=0, unbiased=False) + self.config.covariance_floor
         for s in range(self.n_states):
             for k in range(self.n_components):
-                jitter = self.random_state.normal(scale=0.1, size=n_features)
+                jitter = torch.tensor(self.random_state.normal(scale=0.1, size=n_features), dtype=torch.float32, device=self.device)
                 self.means_[s, k] = overall_mean + jitter
-                self.covars_[s, k] = overall_var.copy()
+                self.covars_[s, k] = overall_var.clone()
 
     def fit(self, sequences: Sequence[np.ndarray]) -> "BinaryGMMHMM":
-        X = np.concatenate(sequences, axis=0)
+        torch_sequences = [torch.as_tensor(seq, dtype=torch.float32, device=self.device) for seq in sequences if len(seq)]
+        if not torch_sequences:
+            raise ValueError("No training sequences provided.")
+        X = torch.cat(torch_sequences, dim=0)
         self._init_params(X)
-        last_ll = -np.inf
+        last_ll = -float("inf")
         for _ in range(self.config.n_iter):
-            start_acc = np.zeros(self.n_states, dtype=np.float64)
-            trans_acc = np.zeros((self.n_states, self.n_states), dtype=np.float64)
-            gamma_acc = np.zeros(self.n_states, dtype=np.float64)
-            comp_gamma = np.zeros((self.n_states, self.n_components), dtype=np.float64)
-            mean_num = np.zeros_like(self.means_, dtype=np.float64)
-            cov_num = np.zeros_like(self.covars_, dtype=np.float64)
+            start_acc = torch.zeros(self.n_states, dtype=torch.float32, device=self.device)
+            trans_acc = torch.zeros((self.n_states, self.n_states), dtype=torch.float32, device=self.device)
+            gamma_acc = torch.zeros(self.n_states, dtype=torch.float32, device=self.device)
+            comp_gamma = torch.zeros((self.n_states, self.n_components), dtype=torch.float32, device=self.device)
+            mean_num = torch.zeros_like(self.means_)
+            cov_num = torch.zeros_like(self.covars_)
             ll = 0.0
-            for seq in sequences:
+            for seq in torch_sequences:
                 gamma, xi, seq_ll = self._forward_backward(seq)
                 ll += seq_ll
                 start_acc += gamma[0]
-                trans_acc += xi.sum(axis=0)
-                gamma_acc += gamma.sum(axis=0)
+                trans_acc += xi.sum(dim=0)
+                gamma_acc += gamma.sum(dim=0)
                 for s in range(self.n_states):
+                    resp = gamma[:, s]
                     for k in range(self.n_components):
-                        resp = gamma[:, s]
                         comp_gamma[s, k] += resp.sum() / self.n_components
-                        mean_num[s, k] += (resp[:, None] * seq).sum(axis=0) / self.n_components
-                        cov_num[s, k] += (resp[:, None] * (seq ** 2)).sum(axis=0) / self.n_components
-            self.startprob_ = start_acc / np.maximum(start_acc.sum(), EPS)
-            self.transmat_ = trans_acc / np.maximum(trans_acc.sum(axis=1, keepdims=True), EPS)
+                        mean_num[s, k] += (resp.unsqueeze(1) * seq).sum(dim=0) / self.n_components
+                        cov_num[s, k] += (resp.unsqueeze(1) * (seq ** 2)).sum(dim=0) / self.n_components
+            self.startprob_ = start_acc / torch.clamp(start_acc.sum(), min=EPS)
+            self.transmat_ = trans_acc / torch.clamp(trans_acc.sum(dim=1, keepdim=True), min=EPS)
             for s in range(self.n_states):
                 for k in range(self.n_components):
-                    denom = max(comp_gamma[s, k], EPS)
-                    self.weights_[s, k] = denom / max(gamma_acc[s], EPS)
+                    denom = torch.clamp(comp_gamma[s, k], min=EPS)
+                    self.weights_[s, k] = denom / torch.clamp(gamma_acc[s], min=EPS)
                     mean = mean_num[s, k] / denom
-                    var = cov_num[s, k] / denom - mean**2
+                    var = cov_num[s, k] / denom - mean ** 2
                     self.means_[s, k] = mean
-                    self.covars_[s, k] = np.maximum(var, self.config.covariance_floor)
+                    self.covars_[s, k] = torch.clamp(var, min=self.config.covariance_floor)
             if abs(ll - last_ll) < self.config.tol:
                 break
             last_ll = ll
         return self
 
     def score(self, X: np.ndarray) -> float:
-        _, _, ll = self._forward_backward(X)
+        seq = torch.as_tensor(X, dtype=torch.float32, device=self.device)
+        _, _, ll = self._forward_backward(seq)
         return ll
 
     def predict_states(self, X: np.ndarray) -> np.ndarray:
-        log_emit = self._log_mix_emission(X)
-        log_start = np.log(self.startprob_ + EPS)
-        log_trans = np.log(self.transmat_ + EPS)
-        T = X.shape[0]
-        delta = np.zeros((T, self.n_states), dtype=np.float64)
-        psi = np.zeros((T, self.n_states), dtype=np.int32)
+        seq = torch.as_tensor(X, dtype=torch.float32, device=self.device)
+        log_emit = self._log_mix_emission(seq)
+        log_start = torch.log(self.startprob_ + EPS)
+        log_trans = torch.log(self.transmat_ + EPS)
+        T = seq.shape[0]
+        delta = torch.empty((T, self.n_states), device=self.device, dtype=torch.float32)
+        psi = torch.zeros((T, self.n_states), dtype=torch.int64, device=self.device)
         delta[0] = log_start + log_emit[0]
         for t in range(1, T):
-            for j in range(self.n_states):
-                vals = delta[t - 1] + log_trans[:, j]
-                psi[t, j] = int(np.argmax(vals))
-                delta[t, j] = np.max(vals) + log_emit[t, j]
-        states = np.zeros(T, dtype=np.int32)
-        states[-1] = int(np.argmax(delta[-1]))
+            vals = delta[t - 1].unsqueeze(1) + log_trans
+            psi[t] = torch.argmax(vals, dim=0)
+            delta[t] = torch.max(vals, dim=0).values + log_emit[t]
+        states = torch.zeros(T, dtype=torch.int64, device=self.device)
+        states[-1] = torch.argmax(delta[-1])
         for t in range(T - 2, -1, -1):
             states[t] = psi[t + 1, states[t + 1]]
-        return states
+        return states.cpu().numpy()
 
 
 def _group_by_recording(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
@@ -411,10 +407,12 @@ def _score_one_label(
     frame_truth = []
     frame_pred = []
     for _, row in rows.iterrows():
-        audio, sr = _load_audio(Path(row["filepath"]), TARGET_SR)
-        feats = scaler.transform(extract_mfcc_features(audio, sr)).astype(np.float32)
-        gamma, _, _ = model._forward_backward(feats)
-        active = temporal_postprocess(gamma[:, ACTIVE_STATE])
+        audio_t, sr = _load_audio_tensor(Path(row["filepath"]), TARGET_SR)
+        feats = extract_mfcc_features_torch(audio_t, sr=sr, device=DEFAULT_DEVICE).cpu().numpy().astype(np.float32)
+        feats = scaler.transform(feats).astype(np.float32)
+        feats_t = torch.as_tensor(feats, dtype=torch.float32, device=DEFAULT_DEVICE)
+        gamma, _, _ = model._forward_backward(feats_t)
+        active = temporal_postprocess(gamma[:, ACTIVE_STATE].cpu().numpy())
         pred_segments = _binary_event_segments(active, FEATURE_HOP_SECONDS)
         gt_duration = len(active) * FEATURE_HOP_SECONDS
         truths.append((0.0, gt_duration))
@@ -433,10 +431,10 @@ def _score_one_label(
 def _score_model_window(
     label: str,
     model: BinaryGMMHMM,
-    features: np.ndarray,
+    features: torch.Tensor,
 ) -> Tuple[str, np.ndarray]:
     gamma, _, _ = model._forward_backward(features)
-    return label, gamma[:, ACTIVE_STATE]
+    return label, gamma[:, ACTIVE_STATE].cpu().numpy()
 
 
 def _binary_event_segments(states: np.ndarray, frame_hop_seconds: float) -> List[Tuple[float, float]]:
@@ -587,12 +585,12 @@ def infer_continuous_file(
     probs = {label: np.zeros(total_frames, dtype=np.float32) for label in CLASSES}
     for w_idx in range(n_windows):
         clip = frames[w_idx]
-        features = scaler.transform(
-            extract_mfcc_features_torch(clip.unsqueeze(0), sr=sr, device=DEFAULT_DEVICE).cpu().numpy().astype(np.float32)
-        ).astype(np.float32)
+        features = extract_mfcc_features_torch(clip.unsqueeze(0), sr=sr, device=DEFAULT_DEVICE).cpu().numpy().astype(np.float32)
+        features = scaler.transform(features).astype(np.float32)
+        features_t = torch.as_tensor(features, dtype=torch.float32, device=DEFAULT_DEVICE)
         frame_offset = int(round((w_idx * INFERENCE_HOP_SECONDS) / hop_seconds))
         results = Parallel(n_jobs=-1, prefer="threads")(
-            delayed(_score_model_window)(label, model, features)
+            delayed(_score_model_window)(label, model, features_t)
             for label, model in models.items()
         )
         for label, active in results:
