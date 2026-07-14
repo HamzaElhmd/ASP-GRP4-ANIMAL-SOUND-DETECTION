@@ -69,8 +69,8 @@ class SequentialFrameDataset(Dataset):
 
 
 def build_dataset(split_name: str, csv_path: Path = PROCESSED_CSV, split_csv: Path = SPLIT_CSV) -> SequentialFrameDataset:
-    if split_name not in ("train", "val"):
-        raise ValueError(f"split_name must be 'train' or 'val', got {split_name!r}")
+    if split_name not in ("train", "val", "test"):
+        raise ValueError(f"split_name must be 'train', 'val', or 'test', got {split_name!r}")
 
     all_frames = pd.read_csv(csv_path)
     split_df = load_split(split_csv)

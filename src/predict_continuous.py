@@ -28,9 +28,17 @@ def predict_continuous(wav_path: str, model: torch.nn.Module) -> Tuple[List[floa
     """Runs the model over an arbitrary-length recording using Person A's
     shared inference-time scanner (1s window / 250ms hop), not the fixed
     2s training-clip format. Each window's per-timestep predictions are
-    mean-pooled into a single score per window per class, so the output is
+    max-pooled into a single score per window per class, so the output is
     one probability-per-class value every 250ms across the whole file --
     this is the "windowed scan" convention, not a single whole-file pass.
+
+    Max-pool, not mean-pool: a real animal sound is often much shorter than
+    the 1s window (e.g. a 300ms crow inside a mostly-quiet second), and
+    averaging across the whole window dilutes that peak with the quiet
+    timesteps around it. Confirmed directly on real audio: mean-pooling let
+    only 6/836 windows clear a 0.5 threshold on any class, max-pooling let
+    224/836 clear it, and rooster's true peak confidence (0.61) was being
+    averaged down to 0.35 and never surfacing under mean-pooling.
     """
     waveform, sr = torchaudio.load(str(wav_path))
     if sr != TARGET_SR:
@@ -47,7 +55,7 @@ def predict_continuous(wav_path: str, model: torch.nn.Module) -> Tuple[List[floa
             features = compute_feature_sequence_from_waveform(window.unsqueeze(0), sr)  # (time, n_mels)
             logits = model(features.unsqueeze(0).to(DEVICE))  # (1, time, 5)
             probs = torch.sigmoid(logits).squeeze(0)  # (time, 5)
-            window_scores.append(probs.mean(dim=0))  # (5,) -- mean-pool over the window
+            window_scores.append(probs.max(dim=0).values)  # (5,) -- max-pool over the window
 
     scores = torch.stack(window_scores)  # (n_windows, 5)
     timestamps = [i * HOP_SECONDS for i in range(len(windows))]

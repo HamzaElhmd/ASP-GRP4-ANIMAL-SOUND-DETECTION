@@ -4,15 +4,15 @@ from typing import List, Tuple
 
 import matplotlib.pyplot as plt
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 try:
     from eda import N_MELS
-    from sequential_data import build_dataset
+    from sequential_data import ANIMAL_CLASSES, build_dataset
     from sequential_model import SequentialEventDetector
 except ModuleNotFoundError:
     from src.eda import N_MELS
-    from src.sequential_data import build_dataset
+    from src.sequential_data import ANIMAL_CLASSES, build_dataset
     from src.sequential_model import SequentialEventDetector
 
 OUTPUT_DIR = Path("runs/sequential")
@@ -22,6 +22,35 @@ DEVICE = torch.device("cpu")
 def frame_accuracy(logits: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5) -> float:
     preds = (torch.sigmoid(logits) > threshold).float()
     return (preds == targets).float().mean().item()
+
+
+def compute_class_pos_weight(train_ds) -> torch.Tensor:
+    """pos_weight per class for BCEWithLogitsLoss: (n_negative / n_positive)
+    counted directly from the train split. Classes with fewer positive
+    examples (rooster, sheep, cow) get a higher weight, so a missed rooster
+    costs the loss more than a missed cat -- directly counters the ~4x
+    cat-vs-sheep imbalance. Tried and found to help some classes (sheep)
+    but not clearly beat the plain baseline within 6 epochs on others --
+    see runs/sequential/SUMMARY.md. Kept as an option, not the default,
+    since it isn't a proven win yet.
+    """
+    counts = torch.zeros(len(ANIMAL_CLASSES))
+    for label in train_ds.rows["label"]:
+        if label in ANIMAL_CLASSES:
+            counts[ANIMAL_CLASSES.index(label)] += 1
+    total = len(train_ds)
+    return (total - counts) / counts
+
+
+def build_balanced_sampler(train_ds) -> WeightedRandomSampler:
+    """Per-sample weight = 1 / (count of that sample's class), so each class
+    gets roughly equal expected exposure per epoch. Same caveat as
+    compute_class_pos_weight -- combining both at full strength overcorrected
+    (see SUMMARY.md), use at most one at a time."""
+    labels = train_ds.rows["label"].tolist()
+    class_counts = train_ds.rows["label"].value_counts().to_dict()
+    weights = [1.0 / class_counts[label] for label in labels]
+    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
 
 def overfit_sanity_check(n_clips: int = 16, epochs: int = 150, lr: float = 1e-2) -> Tuple[SequentialEventDetector, List[float], List[float]]:
@@ -73,14 +102,21 @@ def full_training_run(
     hidden_size: int = 64,
     num_layers: int = 1,
     num_workers: int = 4,
+    use_pos_weight: bool = False,
+    use_balanced_sampler: bool = False,
 ) -> Tuple[SequentialEventDetector, List[float], List[float]]:
     train_ds = build_dataset("train")
     val_ds = build_dataset("val")
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+
+    sampler = build_balanced_sampler(train_ds) if use_balanced_sampler else None
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=(sampler is None), sampler=sampler, num_workers=num_workers
+    )
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     model = SequentialEventDetector(input_size=N_MELS, hidden_size=hidden_size, num_layers=num_layers).to(DEVICE)
-    criterion = torch.nn.BCEWithLogitsLoss()
+    pos_weight = compute_class_pos_weight(train_ds) if use_pos_weight else None
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     train_losses, val_losses = [], []

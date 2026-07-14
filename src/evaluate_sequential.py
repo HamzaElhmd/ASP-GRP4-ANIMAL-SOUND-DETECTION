@@ -39,11 +39,15 @@ def run_inference(model: SequentialEventDetector, loader: DataLoader) -> Tuple[t
     return torch.cat(all_logits, dim=0), torch.cat(all_targets, dim=0)
 
 
-def evaluate_frame_level(model: SequentialEventDetector, threshold: float = 0.5) -> None:
-    val_ds = build_dataset("val")
-    val_loader = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=4)
+def evaluate_frame_level(model: SequentialEventDetector, threshold: float = 0.5, split_name: str = "test") -> None:
+    """Defaults to the test split, not val. val is for tuning decisions
+    (threshold calibration, early stopping); test is untouched until this
+    final report, so the numbers here aren't optimistic from having already
+    been used to pick something."""
+    eval_ds = build_dataset(split_name)
+    eval_loader = DataLoader(eval_ds, batch_size=32, shuffle=False, num_workers=4)
 
-    logits, targets = run_inference(model, val_loader)
+    logits, targets = run_inference(model, eval_loader)
     preds = (torch.sigmoid(logits) > threshold).float()
 
     preds_flat = preds.reshape(-1, preds.shape[-1]).numpy()
@@ -63,6 +67,7 @@ def evaluate_frame_level(model: SequentialEventDetector, threshold: float = 0.5)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_DIR / "frame_level_metrics.txt", "w") as f:
+        f.write(f"split: {split_name}\n")
         f.write(f"threshold: {threshold}\n\n")
         f.write(f"{'class':10s} {'precision':>10s} {'recall':>10s} {'f1':>10s} {'support':>10s}\n")
         for i, cls in enumerate(ANIMAL_CLASSES):
@@ -70,9 +75,46 @@ def evaluate_frame_level(model: SequentialEventDetector, threshold: float = 0.5)
         f.write(f"{'macro avg':10s} {macro_p:10.3f} {macro_r:10.3f} {macro_f1:10.3f} {'':>10s}\n")
 
 
-def plot_qualitative_examples(model: SequentialEventDetector, n_examples: int = 4) -> None:
+def calibrate_thresholds(model: SequentialEventDetector, thresholds=None) -> dict:
+    """Per-class threshold that maximizes that class's F1 on the val set
+    (tuning data, not test), instead of the same flat 0.5 for every class.
+    No retraining -- cheapest thing to try before touching the loss
+    function, sampler, or architecture. Note: calibrating on val doesn't
+    always transfer to real continuous audio (see calibrate_real_world.py
+    and SUMMARY.md for a case where it made cat worse, not better) --
+    treat this as a diagnostic, not the final answer on its own."""
+    if thresholds is None:
+        thresholds = [round(t, 2) for t in np.arange(0.05, 0.96, 0.05)]
+
     val_ds = build_dataset("val")
-    rows = val_ds.rows
+    val_loader = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=4)
+    logits, targets = run_inference(model, val_loader)
+    probs = torch.sigmoid(logits).reshape(-1, logits.shape[-1]).numpy()
+    targets_flat = targets.reshape(-1, targets.shape[-1]).numpy()
+
+    best_thresholds = {}
+    print(f"{'class':10s} {'best_thresh':>12s} {'f1_at_0.5':>10s} {'f1_calibrated':>14s}")
+    for i, cls in enumerate(ANIMAL_CLASSES):
+        best_f1, best_t = -1.0, 0.5
+        f1_at_half = None
+        for t in thresholds:
+            preds = (probs[:, i] > t).astype(float)
+            _, _, f1, _ = precision_recall_fscore_support(
+                targets_flat[:, i], preds, average="binary", zero_division=0
+            )
+            if abs(t - 0.5) < 1e-9:
+                f1_at_half = f1
+            if f1 > best_f1:
+                best_f1, best_t = f1, t
+        best_thresholds[cls] = best_t
+        print(f"{cls:10s} {best_t:12.2f} {f1_at_half:10.3f} {best_f1:14.3f}")
+
+    return best_thresholds
+
+
+def plot_qualitative_examples(model: SequentialEventDetector, n_examples: int = 4, split_name: str = "test") -> None:
+    eval_ds = build_dataset(split_name)
+    rows = eval_ds.rows
 
     seen_labels = set()
     chosen_indices = []
@@ -89,7 +131,7 @@ def plot_qualitative_examples(model: SequentialEventDetector, n_examples: int = 
 
     for idx in chosen_indices:
         row = rows.iloc[idx]
-        features, target = val_ds[idx]
+        features, target = eval_ds[idx]
         with torch.no_grad():
             logits = model(features.unsqueeze(0).to(DEVICE))
             probs = torch.sigmoid(logits).squeeze(0).numpy()
@@ -114,7 +156,7 @@ def plot_qualitative_examples(model: SequentialEventDetector, n_examples: int = 
 
 if __name__ == "__main__":
     model = load_trained_model()
-    print("=== Frame-level precision/recall/F1 (val set) ===")
+    print("=== Frame-level precision/recall/F1 (test set) ===")
     evaluate_frame_level(model)
 
     print("\n=== Qualitative examples ===")
