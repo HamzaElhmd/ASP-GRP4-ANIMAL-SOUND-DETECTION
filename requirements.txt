@@ -7,3 +7,5 @@ matplotlib==3.9.4
 scikit-learn==1.6.1
 tensorflow==2.16.2
 tensorflow-hub==0.16.1
+streamlit==1.50.0
+streamlit-advanced-audio==0.1.2

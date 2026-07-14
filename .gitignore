@@ -2,6 +2,9 @@
 # analysis artifacts (csv/md/txt) tracked, not the raw copyrighted audio.
 eda_outputs/multilabel_sources/*.wav
 
+# Local Streamlit runtime config/cache -- not app code, machine-specific.
+.streamlit/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
