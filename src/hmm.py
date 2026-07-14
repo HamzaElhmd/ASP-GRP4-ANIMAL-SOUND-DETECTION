@@ -11,7 +11,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import joblib
 import numpy as np
 import pandas as pd
-from scipy.fft import dct
+import torch
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.preprocessing import StandardScaler
 from joblib import Parallel, delayed
@@ -43,6 +43,7 @@ TARGET_SR = PREP_TARGET_SR
 FEATURE_HOP_SECONDS = 0.01
 INFERENCE_WINDOW_SECONDS = PREP_INFERENCE_WINDOW_SECONDS
 INFERENCE_HOP_SECONDS = PREP_INFERENCE_HOP_SECONDS
+DEFAULT_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CLASSES = ["dog", "cat", "sheep", "cow", "rooster", "background"]
 ACTIVE_STATE = 1
 INACTIVE_STATE = 0
@@ -56,60 +57,62 @@ def _load_audio(path: Path, target_sr: int = TARGET_SR) -> Tuple[np.ndarray, int
     return audio, target_sr
 
 
-def _frame_signal(audio: np.ndarray, frame_length: int, hop_length: int) -> np.ndarray:
-    if audio.size == 0:
-        return np.zeros((1, frame_length), dtype=np.float32)
-    if audio.shape[0] < frame_length:
-        audio = np.pad(audio, (0, frame_length - audio.shape[0]))
-    n_frames = 1 + max(0, (audio.shape[0] - frame_length) // hop_length)
-    frames = []
-    for idx in range(n_frames):
-        start = idx * hop_length
-        end = start + frame_length
-        frame = audio[start:end]
-        if frame.shape[0] < frame_length:
-            frame = np.pad(frame, (0, frame_length - frame.shape[0]))
-        frames.append(frame)
-    return np.stack(frames, axis=0)
+def _load_audio_tensor(path: Path, target_sr: int = TARGET_SR) -> Tuple[torch.Tensor, int]:
+    if torchaudio is None:
+        raise RuntimeError("torchaudio is required for the HMM pipeline")
+    audio = load_standardized_audio(path, target_sr=target_sr)
+    return audio, target_sr
 
 
-def _hz_to_mel(hz: np.ndarray) -> np.ndarray:
-    return 2595.0 * np.log10(1.0 + hz / 700.0)
-
-
-def _mel_to_hz(mel: np.ndarray) -> np.ndarray:
-    return 700.0 * (10 ** (mel / 2595.0) - 1.0)
-
-
-def _mel_filterbank(sr: int, n_fft: int, n_mels: int = 26, fmin: int = 0, fmax: Optional[int] = None) -> np.ndarray:
-    fmax = fmax or sr // 2
-    mels = np.linspace(_hz_to_mel(np.array([fmin]))[0], _hz_to_mel(np.array([fmax]))[0], n_mels + 2)
-    hz = _mel_to_hz(mels)
-    bins = np.floor((n_fft + 1) * hz / sr).astype(int)
-    fb = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float32)
-    for m in range(1, n_mels + 1):
-        left, center, right = bins[m - 1], bins[m], bins[m + 1]
-        left = max(left, 0)
-        right = min(right, n_fft // 2)
-        for k in range(left, center):
-            fb[m - 1, k] = (k - left) / max(center - left, 1)
-        for k in range(center, right):
-            fb[m - 1, k] = (right - k) / max(right - center, 1)
-    return fb
-
-
-def _delta(features: np.ndarray, width: int = 2) -> np.ndarray:
+def _delta_torch(features: torch.Tensor, width: int = 2) -> torch.Tensor:
     if features.shape[0] == 1:
-        return np.zeros_like(features)
+        return torch.zeros_like(features)
     denom = 2 * sum(i * i for i in range(1, width + 1))
-    padded = np.pad(features, ((width, width), (0, 0)), mode="edge")
-    out = np.zeros_like(features)
+    padded = torch.nn.functional.pad(features, (0, 0, width, width), mode="replicate")
+    out = torch.zeros_like(features)
     for t in range(features.shape[0]):
-        acc = np.zeros(features.shape[1], dtype=np.float32)
+        acc = torch.zeros(features.shape[1], device=features.device, dtype=features.dtype)
         for i in range(1, width + 1):
-            acc += i * (padded[t + width + i] - padded[t + width - i])
+            acc = acc + i * (padded[t + width + i] - padded[t + width - i])
         out[t] = acc / denom
     return out
+
+
+def extract_mfcc_features_torch(
+    audio: torch.Tensor,
+    sr: int = TARGET_SR,
+    n_mfcc: int = 13,
+    n_fft: int = 512,
+    hop_length: int = 160,
+    win_length: int = 400,
+    n_mels: int = 26,
+    device: torch.device = DEFAULT_DEVICE,
+) -> torch.Tensor:
+    if audio.dim() == 1:
+        audio = audio.unsqueeze(0)
+    audio = audio.to(device=device, dtype=torch.float32)
+    if audio.shape[0] != 1:
+        audio = audio.mean(dim=0, keepdim=True)
+    if audio.shape[1] < win_length:
+        audio = torch.nn.functional.pad(audio, (0, win_length - audio.shape[1]))
+    mfcc_transform = torchaudio.transforms.MFCC(
+        sample_rate=sr,
+        n_mfcc=n_mfcc,
+        melkwargs={
+            "n_fft": n_fft,
+            "hop_length": hop_length,
+            "win_length": win_length,
+            "n_mels": n_mels,
+            "center": False,
+            "power": 2.0,
+            "norm": "slaney",
+            "mel_scale": "htk",
+        },
+    ).to(device)
+    mfcc = mfcc_transform(audio).squeeze(0).transpose(0, 1)
+    delta = _delta_torch(mfcc)
+    delta2 = _delta_torch(delta)
+    return torch.cat([mfcc, delta, delta2], dim=1).contiguous()
 
 
 def extract_mfcc_features(
@@ -121,17 +124,17 @@ def extract_mfcc_features(
     win_length: int = 400,
     n_mels: int = 26,
 ) -> np.ndarray:
-    frames = _frame_signal(audio, win_length, hop_length)
-    window = np.hanning(win_length).astype(np.float32)
-    frames = frames * window[None, :]
-    spec = np.abs(np.fft.rfft(frames, n=n_fft, axis=1)) ** 2
-    fb = _mel_filterbank(sr, n_fft, n_mels=n_mels)
-    mel = np.dot(spec, fb.T)
-    mel = np.log(np.maximum(mel, EPS))
-    mfcc = dct(mel, type=2, norm="ortho", axis=1)[:, :n_mfcc]
-    delta = _delta(mfcc)
-    delta2 = _delta(delta)
-    return np.concatenate([mfcc, delta, delta2], axis=1).astype(np.float32)
+    features = extract_mfcc_features_torch(
+        torch.from_numpy(audio.astype(np.float32)),
+        sr=sr,
+        n_mfcc=n_mfcc,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        n_mels=n_mels,
+        device=torch.device("cpu"),
+    )
+    return features.cpu().numpy().astype(np.float32)
 
 
 def load_manifest(processed_root: Path = Path("processed")) -> pd.DataFrame:
@@ -353,8 +356,8 @@ def _group_by_recording(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
 
 def _load_sequences(df: pd.DataFrame) -> List[np.ndarray]:
     def _extract_row(row: pd.Series) -> np.ndarray:
-        audio, sr = _load_audio(Path(row["filepath"]), TARGET_SR)
-        return extract_mfcc_features(audio, sr=sr)
+        audio, sr = _load_audio_tensor(Path(row["filepath"]), TARGET_SR)
+        return extract_mfcc_features_torch(audio, sr=sr, device=DEFAULT_DEVICE).cpu().numpy().astype(np.float32)
 
     rows = [row for _, row in df.iterrows()]
     if not rows:
@@ -569,24 +572,24 @@ def infer_continuous_file(
 ) -> List[Dict[str, str]]:
     scaler: StandardScaler = joblib.load(model_dir / "feature_scaler.joblib")
     models = {label: joblib.load(model_dir / f"{label}_hmm.joblib") for label in CLASSES}
-    audio, sr = _load_audio(wav_path, TARGET_SR)
+    audio_t, sr = _load_audio_tensor(wav_path, TARGET_SR)
     if torchaudio is None:
         raise RuntimeError("torchaudio is required for inference windowing")
-    waveform = np.asarray(audio, dtype=np.float32)
-    waveform_t = torch.from_numpy(waveform).unsqueeze(0)
     frames = inference_time_windowing(
-        waveform_t,
+        audio_t,
         sr,
         window_seconds=INFERENCE_WINDOW_SECONDS,
         hop_seconds=INFERENCE_HOP_SECONDS,
         window_function="hann",
-    ).cpu().numpy()
+    )
     n_windows = frames.shape[0]
-    total_frames = int(math.ceil(audio.shape[0] / sr / hop_seconds))
+    total_frames = int(math.ceil(audio_t.shape[1] / sr / hop_seconds))
     probs = {label: np.zeros(total_frames, dtype=np.float32) for label in CLASSES}
     for w_idx in range(n_windows):
         clip = frames[w_idx]
-        features = scaler.transform(extract_mfcc_features(clip.astype(np.float32), sr)).astype(np.float32)
+        features = scaler.transform(
+            extract_mfcc_features_torch(clip.unsqueeze(0), sr=sr, device=DEFAULT_DEVICE).cpu().numpy().astype(np.float32)
+        ).astype(np.float32)
         frame_offset = int(round((w_idx * INFERENCE_HOP_SECONDS) / hop_seconds))
         results = Parallel(n_jobs=-1, prefer="threads")(
             delayed(_score_model_window)(label, model, features)
