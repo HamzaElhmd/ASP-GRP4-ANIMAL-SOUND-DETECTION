@@ -17,8 +17,16 @@ from scipy.signal import resample_poly
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.preprocessing import StandardScaler
 
+try:
+    import torchaudio
+except Exception:  # pragma: no cover
+    torchaudio = None
+
 
 TARGET_SR = 16000
+FEATURE_HOP_SECONDS = 0.01
+INFERENCE_WINDOW_SECONDS = 1.0
+INFERENCE_HOP_SECONDS = 0.25
 CLASSES = ["dog", "cat", "sheep", "cow", "rooster", "background"]
 ACTIVE_STATE = 1
 INACTIVE_STATE = 0
@@ -26,15 +34,19 @@ EPS = 1e-8
 
 
 def _load_audio(path: Path, target_sr: int = TARGET_SR) -> Tuple[np.ndarray, int]:
-    sr, audio = wavfile.read(str(path))
-    audio = np.asarray(audio)
-    if audio.ndim == 2:
-        audio = audio.mean(axis=1)
-    if np.issubdtype(audio.dtype, np.integer):
-        max_val = np.iinfo(audio.dtype).max
-        audio = audio.astype(np.float32) / max_val
+    if torchaudio is not None:
+        audio_t, sr = torchaudio.load(str(path))
+        audio = audio_t.mean(dim=0).cpu().numpy().astype(np.float32)
     else:
-        audio = audio.astype(np.float32)
+        sr, audio = wavfile.read(str(path))
+        audio = np.asarray(audio)
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+        if np.issubdtype(audio.dtype, np.integer):
+            max_val = np.iinfo(audio.dtype).max
+            audio = audio.astype(np.float32) / max_val
+        else:
+            audio = audio.astype(np.float32)
     peak = np.max(np.abs(audio)) if audio.size else 0.0
     if peak > 0:
         audio = audio / peak
@@ -488,25 +500,45 @@ def infer_continuous_file(
     model_dir: Path = Path("artifacts/hmm"),
     threshold: float = 0.5,
     median_width: int = 5,
-    gap_fill_frames: int = 3,
-    hop_seconds: float = 0.025,
+    gap_fill_ms: int = 300,
+    hop_seconds: float = FEATURE_HOP_SECONDS,
 ) -> List[Dict[str, str]]:
     scaler: StandardScaler = joblib.load(model_dir / "feature_scaler.joblib")
     models = {label: joblib.load(model_dir / f"{label}_hmm.joblib") for label in CLASSES}
     audio, sr = _load_audio(wav_path, TARGET_SR)
-    features = extract_mfcc_features(audio, sr)
-    features = scaler.transform(features).astype(np.float32)
-    probs = {}
-    for label, model in models.items():
-        gamma, _, _ = model._forward_backward(features)
-        probs[label] = gamma[:, ACTIVE_STATE]
+    window_samples = int(INFERENCE_WINDOW_SECONDS * sr)
+    hop_samples = int(INFERENCE_HOP_SECONDS * sr)
+    if audio.shape[0] < window_samples:
+        audio = np.pad(audio, (0, window_samples - audio.shape[0]))
+    n_windows = 1 + max(0, (audio.shape[0] - window_samples) // hop_samples)
+    total_frames = int(math.ceil(audio.shape[0] / sr / hop_seconds))
+    probs = {label: np.zeros(total_frames, dtype=np.float32) for label in CLASSES}
+    window = np.hanning(window_samples).astype(np.float32)
+    for w_idx in range(n_windows):
+        start_sample = w_idx * hop_samples
+        end_sample = start_sample + window_samples
+        clip = audio[start_sample:end_sample]
+        if clip.shape[0] < window_samples:
+            clip = np.pad(clip, (0, window_samples - clip.shape[0]))
+        clip = clip * window
+        features = scaler.transform(extract_mfcc_features(clip, sr)).astype(np.float32)
+        frame_offset = int(round(start_sample / sr / hop_seconds))
+        for label, model in models.items():
+            gamma, _, _ = model._forward_backward(features)
+            active = gamma[:, ACTIVE_STATE]
+            end_frame = min(frame_offset + len(active), total_frames)
+            if end_frame > frame_offset:
+                probs[label][frame_offset:end_frame] = np.maximum(
+                    probs[label][frame_offset:end_frame],
+                    active[: end_frame - frame_offset],
+                )
     outputs = []
     for label in CLASSES:
         active = temporal_postprocess(
             probs[label],
             threshold=threshold,
             median_width=median_width,
-            gap_fill=gap_fill_frames,
+            gap_fill=max(1, int(round((gap_fill_ms / 1000.0) / hop_seconds))),
         )
         segments = _binary_event_segments(active, hop_seconds)
         for start, end in segments:
@@ -539,8 +571,8 @@ def evaluate_suite(
             feats = scaler.transform(extract_mfcc_features(audio, sr)).astype(np.float32)
             gamma, _, _ = models[label]._forward_backward(feats)
             active = temporal_postprocess(gamma[:, ACTIVE_STATE])
-            pred_segments = _binary_event_segments(active, hop_seconds=0.025)
-            gt_duration = len(active) * 0.025
+            pred_segments = _binary_event_segments(active, hop_seconds=FEATURE_HOP_SECONDS)
+            gt_duration = len(active) * FEATURE_HOP_SECONDS
             truths.append((0.0, gt_duration))
             preds.extend(pred_segments)
             frame_truth.extend([1] * len(active))

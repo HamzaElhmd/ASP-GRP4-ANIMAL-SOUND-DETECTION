@@ -15,7 +15,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--output", type=Path, default=Path("result_hmm.json"))
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--median-width", type=int, default=5)
-    parser.add_argument("--gap-fill-frames", type=int, default=3)
+    parser.add_argument("--gap-fill-ms", type=int, default=300)
     args = parser.parse_args(argv)
 
     events = infer_continuous_file(
@@ -23,7 +23,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         model_dir=args.model_dir,
         threshold=args.threshold,
         median_width=args.median_width,
-        gap_fill_frames=args.gap_fill_frames,
+        gap_fill_ms=args.gap_fill_ms,
     )
     save_inference_json(events, args.output)
 
