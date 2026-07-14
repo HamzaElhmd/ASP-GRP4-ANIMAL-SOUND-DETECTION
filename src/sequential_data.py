@@ -18,15 +18,15 @@ except ModuleNotFoundError:
 ANIMAL_CLASSES = ["cat", "cow", "dog", "rooster", "sheep"]
 
 
-def compute_feature_sequence(filepath: str, sample_rate: int) -> torch.Tensor:
-    """Mel-spectrogram (dB), transposed to (time, n_mels) for RNN input.
-
-    Same N_FFT/HOP_LENGTH/WIN_LENGTH/N_MELS as the EDA pass (src/eda.py) --
-    input parameters carried forward from feature selection, not re-chosen.
+def compute_feature_sequence_from_waveform(waveform: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    """Mel-spectrogram (dB) for an in-memory waveform, transposed to
+    (time, n_mels) for RNN input. Shared by both the file-based path
+    (compute_feature_sequence) and continuous/windowed inference
+    (predict_continuous.py), so the exact same transform is used everywhere
+    the model is called -- training, eval, and real-recording inference.
     """
-    waveform, sr = torchaudio.load(str(filepath))
     mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sr,
+        sample_rate=sample_rate,
         n_fft=N_FFT,
         hop_length=HOP_LENGTH,
         win_length=WIN_LENGTH,
@@ -35,6 +35,16 @@ def compute_feature_sequence(filepath: str, sample_rate: int) -> torch.Tensor:
     to_db = torchaudio.transforms.AmplitudeToDB()
     mel_db = to_db(mel_transform(waveform)).squeeze(0)  # (n_mels, time)
     return mel_db.transpose(0, 1)  # (time, n_mels)
+
+
+def compute_feature_sequence(filepath: str, sample_rate: int) -> torch.Tensor:
+    """Mel-spectrogram (dB), transposed to (time, n_mels) for RNN input.
+
+    Same N_FFT/HOP_LENGTH/WIN_LENGTH/N_MELS as the EDA pass (src/eda.py) --
+    input parameters carried forward from feature selection, not re-chosen.
+    """
+    waveform, sr = torchaudio.load(str(filepath))
+    return compute_feature_sequence_from_waveform(waveform, sr)
 
 
 def label_to_target(label: str) -> torch.Tensor:
