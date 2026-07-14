@@ -1,3 +1,7 @@
+# Sourced third-party audio (YouTube rips for multi-label EDA) -- keep the
+# analysis artifacts (csv/md/txt) tracked, not the raw copyrighted audio.
+eda_outputs/multilabel_sources/*.wav
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

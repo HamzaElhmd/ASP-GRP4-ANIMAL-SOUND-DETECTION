@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torchaudio
 import torch
 import pandas as pd
@@ -104,6 +106,23 @@ def _load_mono_resampled_audio(sample: pd.Series, target_sr: int = TARGET_SR) ->
     if peak.item() > 0:
         audio = torch.div(audio, peak)
 
+    return audio
+
+
+def load_standardized_audio(audio_file: str | Path, target_sr: int = TARGET_SR) -> torch.Tensor:
+    audio, sr = torchaudio.load(Path(audio_file))
+    if audio.shape[0] == 2:
+        audio = torch.mean(audio, dim=0, keepdim=True)
+    if sr != target_sr:
+        resampler = torchaudio.transforms.Resample(
+            orig_freq=sr,
+            new_freq=target_sr,
+            lowpass_filter_width=10,
+        )
+        audio = resampler(audio)
+    peak = torch.max(torch.abs(audio))
+    if peak.item() > 0:
+        audio = torch.div(audio, peak)
     return audio
 
 

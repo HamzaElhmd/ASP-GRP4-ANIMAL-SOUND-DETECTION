@@ -12,8 +12,6 @@ import joblib
 import numpy as np
 import pandas as pd
 from scipy.fft import dct
-from scipy.io import wavfile
-from scipy.signal import resample_poly
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.preprocessing import StandardScaler
 
@@ -22,11 +20,28 @@ try:
 except Exception:  # pragma: no cover
     torchaudio = None
 
+try:
+    from preprocessor import (
+        INFERENCE_HOP_SECONDS as PREP_INFERENCE_HOP_SECONDS,
+        INFERENCE_WINDOW_SECONDS as PREP_INFERENCE_WINDOW_SECONDS,
+        TARGET_SR as PREP_TARGET_SR,
+        load_standardized_audio,
+        inference_time_windowing,
+    )
+except ModuleNotFoundError:  # pragma: no cover
+    from src.preprocessor import (  # type: ignore
+        INFERENCE_HOP_SECONDS as PREP_INFERENCE_HOP_SECONDS,
+        INFERENCE_WINDOW_SECONDS as PREP_INFERENCE_WINDOW_SECONDS,
+        TARGET_SR as PREP_TARGET_SR,
+        load_standardized_audio,
+        inference_time_windowing,
+    )
 
-TARGET_SR = 16000
+
+TARGET_SR = PREP_TARGET_SR
 FEATURE_HOP_SECONDS = 0.01
-INFERENCE_WINDOW_SECONDS = 1.0
-INFERENCE_HOP_SECONDS = 0.25
+INFERENCE_WINDOW_SECONDS = PREP_INFERENCE_WINDOW_SECONDS
+INFERENCE_HOP_SECONDS = PREP_INFERENCE_HOP_SECONDS
 CLASSES = ["dog", "cat", "sheep", "cow", "rooster", "background"]
 ACTIVE_STATE = 1
 INACTIVE_STATE = 0
@@ -34,27 +49,10 @@ EPS = 1e-8
 
 
 def _load_audio(path: Path, target_sr: int = TARGET_SR) -> Tuple[np.ndarray, int]:
-    if torchaudio is not None:
-        audio_t, sr = torchaudio.load(str(path))
-        audio = audio_t.mean(dim=0).cpu().numpy().astype(np.float32)
-    else:
-        sr, audio = wavfile.read(str(path))
-        audio = np.asarray(audio)
-        if audio.ndim == 2:
-            audio = audio.mean(axis=1)
-        if np.issubdtype(audio.dtype, np.integer):
-            max_val = np.iinfo(audio.dtype).max
-            audio = audio.astype(np.float32) / max_val
-        else:
-            audio = audio.astype(np.float32)
-    peak = np.max(np.abs(audio)) if audio.size else 0.0
-    if peak > 0:
-        audio = audio / peak
-    if sr != target_sr and audio.size:
-        gcd = math.gcd(sr, target_sr)
-        audio = resample_poly(audio, target_sr // gcd, sr // gcd).astype(np.float32)
-        sr = target_sr
-    return audio, sr
+    if torchaudio is None:
+        raise RuntimeError("torchaudio is required for the HMM pipeline")
+    audio = load_standardized_audio(path, target_sr=target_sr).squeeze(0).cpu().numpy().astype(np.float32)
+    return audio, target_sr
 
 
 def _frame_signal(audio: np.ndarray, frame_length: int, hop_length: int) -> np.ndarray:
@@ -506,23 +504,24 @@ def infer_continuous_file(
     scaler: StandardScaler = joblib.load(model_dir / "feature_scaler.joblib")
     models = {label: joblib.load(model_dir / f"{label}_hmm.joblib") for label in CLASSES}
     audio, sr = _load_audio(wav_path, TARGET_SR)
-    window_samples = int(INFERENCE_WINDOW_SECONDS * sr)
-    hop_samples = int(INFERENCE_HOP_SECONDS * sr)
-    if audio.shape[0] < window_samples:
-        audio = np.pad(audio, (0, window_samples - audio.shape[0]))
-    n_windows = 1 + max(0, (audio.shape[0] - window_samples) // hop_samples)
+    if torchaudio is None:
+        raise RuntimeError("torchaudio is required for inference windowing")
+    waveform = np.asarray(audio, dtype=np.float32)
+    waveform_t = torch.from_numpy(waveform).unsqueeze(0)
+    frames = inference_time_windowing(
+        waveform_t,
+        sr,
+        window_seconds=INFERENCE_WINDOW_SECONDS,
+        hop_seconds=INFERENCE_HOP_SECONDS,
+        window_function="hann",
+    ).cpu().numpy()
+    n_windows = frames.shape[0]
     total_frames = int(math.ceil(audio.shape[0] / sr / hop_seconds))
     probs = {label: np.zeros(total_frames, dtype=np.float32) for label in CLASSES}
-    window = np.hanning(window_samples).astype(np.float32)
     for w_idx in range(n_windows):
-        start_sample = w_idx * hop_samples
-        end_sample = start_sample + window_samples
-        clip = audio[start_sample:end_sample]
-        if clip.shape[0] < window_samples:
-            clip = np.pad(clip, (0, window_samples - clip.shape[0]))
-        clip = clip * window
-        features = scaler.transform(extract_mfcc_features(clip, sr)).astype(np.float32)
-        frame_offset = int(round(start_sample / sr / hop_seconds))
+        clip = frames[w_idx]
+        features = scaler.transform(extract_mfcc_features(clip.astype(np.float32), sr)).astype(np.float32)
+        frame_offset = int(round((w_idx * INFERENCE_HOP_SECONDS) / hop_seconds))
         for label, model in models.items():
             gamma, _, _ = model._forward_backward(features)
             active = gamma[:, ACTIVE_STATE]
