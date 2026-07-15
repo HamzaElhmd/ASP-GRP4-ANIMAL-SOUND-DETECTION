@@ -48,6 +48,7 @@ CLASSES = ["dog", "cat", "sheep", "cow", "rooster", "background"]
 ACTIVE_STATE = 1
 INACTIVE_STATE = 0
 EPS = 1e-8
+_MFCC_TRANSFORM_CACHE: Dict[Tuple[int, int, int, int, int], torch.nn.Module] = {}
 
 
 def _load_audio(path: Path, target_sr: int = TARGET_SR) -> Tuple[np.ndarray, int]:
@@ -95,20 +96,25 @@ def extract_mfcc_features_torch(
         audio = audio.mean(dim=0, keepdim=True)
     if audio.shape[1] < win_length:
         audio = torch.nn.functional.pad(audio, (0, win_length - audio.shape[1]))
-    mfcc_transform = torchaudio.transforms.MFCC(
-        sample_rate=sr,
-        n_mfcc=n_mfcc,
-        melkwargs={
-            "n_fft": n_fft,
-            "hop_length": hop_length,
-            "win_length": win_length,
-            "n_mels": n_mels,
-            "center": False,
-            "power": 2.0,
-            "norm": "slaney",
-            "mel_scale": "htk",
-        },
-    ).to(device)
+    cache_key = (sr, n_mfcc, n_fft, hop_length, win_length, n_mels)
+    mfcc_transform = _MFCC_TRANSFORM_CACHE.get(cache_key)
+    if mfcc_transform is None or getattr(mfcc_transform, "_device", None) != device:
+        mfcc_transform = torchaudio.transforms.MFCC(
+            sample_rate=sr,
+            n_mfcc=n_mfcc,
+            melkwargs={
+                "n_fft": n_fft,
+                "hop_length": hop_length,
+                "win_length": win_length,
+                "n_mels": n_mels,
+                "center": False,
+                "power": 2.0,
+                "norm": "slaney",
+                "mel_scale": "htk",
+            },
+        ).to(device)
+        mfcc_transform._device = device  # type: ignore[attr-defined]
+        _MFCC_TRANSFORM_CACHE[cache_key] = mfcc_transform
     mfcc = mfcc_transform(audio).squeeze(0).transpose(0, 1)
     delta = _delta_torch(mfcc)
     delta2 = _delta_torch(delta)
@@ -358,6 +364,8 @@ def _load_sequences(df: pd.DataFrame) -> List[np.ndarray]:
     rows = [row for _, row in df.iterrows()]
     if not rows:
         return []
+    if DEFAULT_DEVICE.type == "cuda":
+        return [_extract_row(row) for row in rows]
     return Parallel(n_jobs=-1, prefer="threads")(delayed(_extract_row)(row) for row in rows)
 
 
