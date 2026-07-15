@@ -550,8 +550,26 @@ def _score_model_window(
     model: BinaryGMMHMM,
     features: torch.Tensor,
 ) -> Tuple[str, np.ndarray]:
-    gamma, _, _ = model._forward_backward(features)
-    return label, gamma[:, ACTIVE_STATE].cpu().numpy()
+    # Calculate the log-emission probabilities
+    log_emit = model._log_mix_emission(features)
+    log_start = torch.log(model.startprob_ + EPS)
+    log_trans = torch.log(model.transmat_ + EPS)
+    
+    T = features.shape[0]
+    scale = torch.empty(T, device=features.device, dtype=torch.float32)
+    
+    # Forward pass to get frame-wise marginal log-likelihoods (scale)
+    alpha = log_start + log_emit[0]
+    scale[0] = torch.logsumexp(alpha, dim=0)
+    alpha = alpha - scale[0]
+    
+    for t in range(1, T):
+        alpha = torch.logsumexp(alpha.unsqueeze(1) + log_trans, dim=0) + log_emit[t]
+        scale[t] = torch.logsumexp(alpha, dim=0)
+        alpha = alpha - scale[t]
+        
+    # Return the actual log-likelihood per frame, not the internal gamma state
+    return label, scale.cpu().numpy()
 
 
 def _binary_event_segments(states: np.ndarray, frame_hop_seconds: float) -> List[Tuple[float, float]]:
@@ -729,8 +747,9 @@ def infer_continuous_file(
     wav_path: Path,
     model_dir: Path = Path("artifacts/hmm"),
     threshold: float = 0.5,
-    median_width: int = 5,
+    median_width: int = 15,
     gap_fill_ms: int = 300,
+    min_duration_ms: int = 200,
     hop_seconds: float = FEATURE_HOP_SECONDS,
     verbose: bool = False,
 ) -> List[Dict[str, str]]:
@@ -780,32 +799,61 @@ def infer_continuous_file(
             delayed(_score_model_window)(label, model, features_t)
             for label, model in models.items()
         )
-        for label, active in results:
-            end_frame = min(frame_offset + len(active), total_frames)
+
+        # Compute Softmax probabilities across all models
+        ll_dict = dict(results)
+        ll_stack = np.stack([ll_dict[lbl] for lbl in CLASSES], axis=0) # Shape: (6, T)
+
+        ll_max = np.max(ll_stack, axis=0)
+        exp_ll = np.exp(ll_stack - ll_max)
+        softmax_probs = exp_ll / np.sum(exp_ll, axis=0)
+
+        for i, label in enumerate(CLASSES):
+            active_prob = softmax_probs[i]
+            end_frame = min(frame_offset + len(active_prob), total_frames)
             if end_frame > frame_offset:
                 probs[label][frame_offset:end_frame] = np.maximum(
                     probs[label][frame_offset:end_frame],
-                    active[: end_frame - frame_offset],
+                    active_prob[: end_frame - frame_offset],
                 )
-    t_scoring = time.perf_counter() - t0
+
+                t_scoring = time.perf_counter() - t0
+
+    # --- NEW: Enforce Mutually Exclusive Classes ---
+    # Stack probabilities to find the dominant class per frame
+    prob_stack = np.stack([probs[lbl] for lbl in CLASSES], axis=0)
+    dominant_indices = np.argmax(prob_stack, axis=0)
+
+    for i, label in enumerate(CLASSES):
+        # Zero out the probability if it's not the highest scoring class
+        probs[label] = np.where(dominant_indices == i, probs[label], 0.0)
+    # -----------------------------------------------
 
     # Post-processing
     t0 = time.perf_counter()
     outputs = []
-    for label in CLASSES:
-        active = temporal_postprocess(
+    min_dur_sec = min_duration_ms / 1000.0
 
+    for label in CLASSES:
+        if label == "background":
+            continue
+
+        active = temporal_postprocess(
             probs[label],
             threshold=threshold,
             median_width=median_width,
             gap_fill=max(1, int(round((gap_fill_ms / 1000.0) / hop_seconds))),
         )
         segments = _binary_event_segments(active, hop_seconds)
+
         for start, end in segments:
-            if end > start:
+            # Filter out the garbage micro-events
+            if (end - start) >= min_dur_sec:
                 outputs.append({"event_start": f"{start:.3f}", "event_end": f"{end:.3f}", "animal": label})
+
     outputs.sort(key=lambda x: (float(x["event_start"]), x["animal"]))
     t_postprocess = time.perf_counter() - t0
+
 
     total_elapsed = time.perf_counter() - total_t0
     if verbose:

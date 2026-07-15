@@ -1,0 +1,97 @@
+[
+  {
+    "event_start": "0.000",
+    "event_end": "1.590",
+    "animal": "dog"
+  },
+  {
+    "event_start": "0.530",
+    "event_end": "5.000",
+    "animal": "cat"
+  },
+  {
+    "event_start": "5.020",
+    "event_end": "6.960",
+    "animal": "dog"
+  },
+  {
+    "event_start": "5.840",
+    "event_end": "7.880",
+    "animal": "rooster"
+  },
+  {
+    "event_start": "7.120",
+    "event_end": "12.180",
+    "animal": "cat"
+  },
+  {
+    "event_start": "10.870",
+    "event_end": "15.740",
+    "animal": "cow"
+  },
+  {
+    "event_start": "12.370",
+    "event_end": "15.120",
+    "animal": "dog"
+  },
+  {
+    "event_start": "15.180",
+    "event_end": "16.460",
+    "animal": "cat"
+  },
+  {
+    "event_start": "16.740",
+    "event_end": "20.540",
+    "animal": "rooster"
+  },
+  {
+    "event_start": "20.730",
+    "event_end": "22.010",
+    "animal": "cat"
+  },
+  {
+    "event_start": "22.110",
+    "event_end": "23.790",
+    "animal": "rooster"
+  },
+  {
+    "event_start": "23.800",
+    "event_end": "26.550",
+    "animal": "cat"
+  },
+  {
+    "event_start": "26.880",
+    "event_end": "29.280",
+    "animal": "dog"
+  },
+  {
+    "event_start": "29.500",
+    "event_end": "29.890",
+    "animal": "cow"
+  },
+  {
+    "event_start": "30.580",
+    "event_end": "49.940",
+    "animal": "cat"
+  },
+  {
+    "event_start": "50.010",
+    "event_end": "55.040",
+    "animal": "dog"
+  },
+  {
+    "event_start": "51.630",
+    "event_end": "53.010",
+    "animal": "cat"
+  },
+  {
+    "event_start": "54.140",
+    "event_end": "56.750",
+    "animal": "cow"
+  },
+  {
+    "event_start": "56.860",
+    "event_end": "59.810",
+    "animal": "cat"
+  }
+]

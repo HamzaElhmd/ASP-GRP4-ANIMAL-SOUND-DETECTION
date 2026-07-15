@@ -1,0 +1,98 @@
+{
+  "frame_based": {
+    "dog": {
+      "precision": 1.0,
+      "recall": 0.8071450546069835,
+      "f1": 0.8932819781669611
+    },
+    "cat": {
+      "precision": 1.0,
+      "recall": 0.4650855265964254,
+      "f1": 0.6348919815990217
+    },
+    "sheep": {
+      "precision": 1.0,
+      "recall": 0.8127285628513727,
+      "f1": 0.8966908554394628
+    },
+    "cow": {
+      "precision": 1.0,
+      "recall": 0.8011254082556172,
+      "f1": 0.8895831512715197
+    },
+    "rooster": {
+      "precision": 1.0,
+      "recall": 0.8338973491257755,
+      "f1": 0.9094264185760418
+    },
+    "background": {
+      "precision": 1.0,
+      "recall": 0.7138594062451931,
+      "f1": 0.8330431348615125
+    }
+  },
+  "event_based": {
+    "dog": {
+      "precision": 0.6741573033707865,
+      "recall": 0.6818181818181818,
+      "f1": 0.6779661016949152
+    },
+    "cat": {
+      "precision": 0.025984911986588432,
+      "recall": 0.08683473389355742,
+      "f1": 0.04
+    },
+    "sheep": {
+      "precision": 0.6451612903225806,
+      "recall": 0.6451612903225806,
+      "f1": 0.6451612903225806
+    },
+    "cow": {
+      "precision": 0.6846153846153846,
+      "recall": 0.689922480620155,
+      "f1": 0.6872586872586872
+    },
+    "rooster": {
+      "precision": 0.7064220183486238,
+      "recall": 0.7129629629629629,
+      "f1": 0.7096774193548386
+    },
+    "background": {
+      "precision": 0.0781758957654723,
+      "recall": 0.2909090909090909,
+      "f1": 0.1232349165596919
+    }
+  },
+  "per_class": {
+    "dog": {
+      "num_test_files": 264,
+      "num_predicted_events": 267,
+      "num_truth_events": 264
+    },
+    "cat": {
+      "num_test_files": 357,
+      "num_predicted_events": 1193,
+      "num_truth_events": 357
+    },
+    "sheep": {
+      "num_test_files": 93,
+      "num_predicted_events": 93,
+      "num_truth_events": 93
+    },
+    "cow": {
+      "num_test_files": 129,
+      "num_predicted_events": 130,
+      "num_truth_events": 129
+    },
+    "rooster": {
+      "num_test_files": 108,
+      "num_predicted_events": 109,
+      "num_truth_events": 108
+    },
+    "background": {
+      "num_test_files": 165,
+      "num_predicted_events": 614,
+      "num_truth_events": 165
+    }
+  }
+}

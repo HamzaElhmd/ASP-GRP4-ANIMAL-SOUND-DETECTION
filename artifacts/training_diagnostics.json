@@ -1,0 +1,33 @@
+{
+  "splits": {
+    "train": 5532,
+    "val": 1179,
+    "test": 1116
+  },
+  "classes": {
+    "dog": {
+      "validation_log_likelihood_mean": -6513.460844797328,
+      "test_log_likelihood_mean": -4799.866586396189
+    },
+    "cat": {
+      "validation_log_likelihood_mean": -9499.562924244365,
+      "test_log_likelihood_mean": -9929.624928877802
+    },
+    "sheep": {
+      "validation_log_likelihood_mean": -5103.114299905711,
+      "test_log_likelihood_mean": -5177.2788847236225
+    },
+    "cow": {
+      "validation_log_likelihood_mean": -4181.710708350466,
+      "test_log_likelihood_mean": -3400.7134659641474
+    },
+    "rooster": {
+      "validation_log_likelihood_mean": -3220.065887451172,
+      "test_log_likelihood_mean": -2919.73897185149
+    },
+    "background": {
+      "validation_log_likelihood_mean": -8778.21724676936,
+      "test_log_likelihood_mean": -9571.809508167613
+    }
+  }
+}
