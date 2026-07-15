@@ -207,6 +207,7 @@ class BinaryHMMConfig:
     tol: float = 1e-3
     covariance_floor: float = 1e-3
     random_state: int = 13
+    device: str = "cpu"
 
 
 class BinaryGMMHMM:
@@ -214,7 +215,10 @@ class BinaryGMMHMM:
         self.config = config
         self.n_states = config.n_states
         self.n_components = config.n_components
-        self.device = DEFAULT_DEVICE
+        if config.device == "auto":
+            self.device = DEFAULT_DEVICE
+        else:
+            self.device = torch.device(config.device)
         self.random_state = np.random.default_rng(config.random_state)
         self.startprob_ = torch.tensor([0.95, 0.05], dtype=torch.float32, device=self.device)
         self.transmat_ = torch.tensor([[0.97, 0.03], [0.08, 0.92]], dtype=torch.float32, device=self.device)
@@ -356,15 +360,15 @@ def _group_by_recording(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     return groups
 
 
-def _load_sequences(df: pd.DataFrame) -> List[np.ndarray]:
+def _load_sequences(df: pd.DataFrame, device: torch.device = torch.device("cpu")) -> List[np.ndarray]:
     def _extract_row(row: pd.Series) -> np.ndarray:
         audio, sr = _load_audio_tensor(Path(row["filepath"]), TARGET_SR)
-        return extract_mfcc_features_torch(audio, sr=sr, device=DEFAULT_DEVICE).cpu().numpy().astype(np.float32)
+        return extract_mfcc_features_torch(audio, sr=sr, device=device).cpu().numpy().astype(np.float32)
 
     rows = [row for _, row in df.iterrows()]
     if not rows:
         return []
-    if DEFAULT_DEVICE.type == "cuda":
+    if device.type == "cuda":
         return [_extract_row(row) for row in rows]
     return Parallel(n_jobs=-1, prefer="threads")(delayed(_extract_row)(row) for row in rows)
 
@@ -536,14 +540,15 @@ def train_hmm_suite(
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(processed_root)
     train_df, val_df, test_df = recording_level_split(manifest)
+    train_device = torch.device(config.device if config and config.device != "auto" else "cpu")
 
     train_sequences_by_label: Dict[str, List[np.ndarray]] = {}
     val_sequences_by_label: Dict[str, List[np.ndarray]] = {}
     test_sequences_by_label: Dict[str, List[np.ndarray]] = {}
     for label in CLASSES:
-        train_sequences_by_label[label] = _load_sequences(train_df[train_df["label"] == label])
-        val_sequences_by_label[label] = _load_sequences(val_df[val_df["label"] == label])
-        test_sequences_by_label[label] = _load_sequences(test_df[test_df["label"] == label])
+        train_sequences_by_label[label] = _load_sequences(train_df[train_df["label"] == label], device=train_device)
+        val_sequences_by_label[label] = _load_sequences(val_df[val_df["label"] == label], device=train_device)
+        test_sequences_by_label[label] = _load_sequences(test_df[test_df["label"] == label], device=train_device)
 
     scaler = _fit_scaler([seq for seqs in train_sequences_by_label.values() for seq in seqs])
     joblib.dump(scaler, output_dir / "feature_scaler.joblib")
