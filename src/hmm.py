@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import warnings
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -208,6 +209,7 @@ class BinaryHMMConfig:
     covariance_floor: float = 1e-3
     random_state: int = 13
     device: str = "cpu"
+    verbose: bool = False
 
 
 class BinaryGMMHMM:
@@ -392,15 +394,23 @@ def _train_one_label(
     config: BinaryHMMConfig,
     output_dir: Path,
 ) -> Tuple[str, Dict[str, Optional[float]]]:
+    if config.verbose:
+        print(f"[train:{label}] scaling sequences")
+    t0 = time.perf_counter()
     train_seq = _transform_sequences(train_sequences, scaler)
     val_seq = _transform_sequences(val_sequences, scaler)
     test_seq = _transform_sequences(test_sequences, scaler)
 
+    if config.verbose:
+        print(f"[train:{label}] fitting model on {len(train_seq)} sequences")
     model = BinaryGMMHMM(config).fit(train_seq)
     joblib.dump(model, output_dir / f"{label}_hmm.joblib")
 
     val_scores = [model.score(seq) for seq in val_seq] if val_seq else []
     test_scores = [model.score(seq) for seq in test_seq] if test_seq else []
+    if config.verbose:
+        elapsed = time.perf_counter() - t0
+        print(f"[train:{label}] done in {elapsed:.1f}s")
     return label, {
         "validation_log_likelihood_mean": float(np.mean(val_scores)) if val_scores else None,
         "test_log_likelihood_mean": float(np.mean(test_scores)) if test_scores else None,
@@ -538,22 +548,36 @@ def train_hmm_suite(
 ) -> Dict[str, object]:
     config = config or BinaryHMMConfig()
     output_dir.mkdir(parents=True, exist_ok=True)
+    total_t0 = time.perf_counter()
     manifest = load_manifest(processed_root)
     train_df, val_df, test_df = recording_level_split(manifest)
     train_device = torch.device(config.device if config and config.device != "auto" else "cpu")
+    if config.verbose:
+        print(f"[train] split sizes train={len(train_df)} val={len(val_df)} test={len(test_df)}")
+        print(f"[train] feature device={train_device}")
 
     train_sequences_by_label: Dict[str, List[np.ndarray]] = {}
     val_sequences_by_label: Dict[str, List[np.ndarray]] = {}
     test_sequences_by_label: Dict[str, List[np.ndarray]] = {}
     for label in CLASSES:
+        if config.verbose:
+            print(f"[train] extracting features for {label}")
+        label_t0 = time.perf_counter()
         train_sequences_by_label[label] = _load_sequences(train_df[train_df["label"] == label], device=train_device)
         val_sequences_by_label[label] = _load_sequences(val_df[val_df["label"] == label], device=train_device)
         test_sequences_by_label[label] = _load_sequences(test_df[test_df["label"] == label], device=train_device)
+        if config.verbose:
+            elapsed = time.perf_counter() - label_t0
+            print(f"[train] extracted {label} in {elapsed:.1f}s")
 
+    if config.verbose:
+        print("[train] fitting scaler")
     scaler = _fit_scaler([seq for seqs in train_sequences_by_label.values() for seq in seqs])
     joblib.dump(scaler, output_dir / "feature_scaler.joblib")
 
     metrics = {"splits": {"train": len(train_df), "val": len(val_df), "test": len(test_df)}, "classes": {}}
+    if config.verbose:
+        print("[train] fitting class models")
     trained = Parallel(n_jobs=-1, prefer="threads")(
         delayed(_train_one_label)(
             label,
@@ -570,6 +594,8 @@ def train_hmm_suite(
 
     metrics_path = output_dir / "training_diagnostics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2))
+    if config.verbose:
+        print(f"[train] total elapsed {time.perf_counter() - total_t0:.1f}s")
     return metrics
 
 
