@@ -1,0 +1,10 @@
+split: test
+threshold: 0.5
+
+class       precision     recall         f1    support
+cat             0.859      0.682      0.760        500
+cow             0.842      0.506      0.632        168
+dog             0.865      0.583      0.697        384
+rooster         0.891      0.340      0.492        144
+sheep           0.798      0.540      0.644        124
+macro avg       0.851      0.530      0.645           
