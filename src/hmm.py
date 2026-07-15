@@ -210,6 +210,7 @@ class BinaryHMMConfig:
     random_state: int = 13
     device: str = "cpu"
     verbose: bool = False
+    max_train_sequences_per_class: Optional[int] = None
 
 
 class BinaryGMMHMM:
@@ -290,10 +291,15 @@ class BinaryGMMHMM:
         torch_sequences = [torch.as_tensor(seq, dtype=torch.float32, device=self.device) for seq in sequences if len(seq)]
         if not torch_sequences:
             raise ValueError("No training sequences provided.")
+        if len(torch_sequences) > 1:
+            order = torch.randperm(len(torch_sequences), generator=torch.Generator().manual_seed(self.config.random_state))
+            torch_sequences = [torch_sequences[i] for i in order.tolist()]
         X = torch.cat(torch_sequences, dim=0)
         self._init_params(X)
         last_ll = -float("inf")
-        for _ in range(self.config.n_iter):
+        for iter_idx in range(self.config.n_iter):
+            if self.config.verbose:
+                print(f"[hmm] iter {iter_idx + 1}/{self.config.n_iter} on {len(torch_sequences)} seqs", flush=True)
             start_acc = torch.zeros(self.n_states, dtype=torch.float32, device=self.device)
             trans_acc = torch.zeros((self.n_states, self.n_states), dtype=torch.float32, device=self.device)
             gamma_acc = torch.zeros(self.n_states, dtype=torch.float32, device=self.device)
@@ -395,14 +401,21 @@ def _train_one_label(
     output_dir: Path,
 ) -> Tuple[str, Dict[str, Optional[float]]]:
     if config.verbose:
-        print(f"[train:{label}] scaling sequences")
+        print(f"[train:{label}] scaling sequences", flush=True)
     t0 = time.perf_counter()
+    if config.max_train_sequences_per_class is not None and len(train_sequences) > config.max_train_sequences_per_class:
+        rng = np.random.default_rng(config.random_state + abs(hash(label)) % 10000)
+        chosen = rng.choice(len(train_sequences), size=config.max_train_sequences_per_class, replace=False)
+        chosen = sorted(chosen.tolist())
+        train_sequences = [train_sequences[i] for i in chosen]
+        if config.verbose:
+            print(f"[train:{label}] capped train seqs to {len(train_sequences)}", flush=True)
     train_seq = _transform_sequences(train_sequences, scaler)
     val_seq = _transform_sequences(val_sequences, scaler)
     test_seq = _transform_sequences(test_sequences, scaler)
 
     if config.verbose:
-        print(f"[train:{label}] fitting model on {len(train_seq)} sequences")
+        print(f"[train:{label}] fitting model on {len(train_seq)} sequences", flush=True)
     model = BinaryGMMHMM(config).fit(train_seq)
     joblib.dump(model, output_dir / f"{label}_hmm.joblib")
 
@@ -410,7 +423,7 @@ def _train_one_label(
     test_scores = [model.score(seq) for seq in test_seq] if test_seq else []
     if config.verbose:
         elapsed = time.perf_counter() - t0
-        print(f"[train:{label}] done in {elapsed:.1f}s")
+        print(f"[train:{label}] done in {elapsed:.1f}s", flush=True)
     return label, {
         "validation_log_likelihood_mean": float(np.mean(val_scores)) if val_scores else None,
         "test_log_likelihood_mean": float(np.mean(test_scores)) if test_scores else None,
@@ -553,31 +566,31 @@ def train_hmm_suite(
     train_df, val_df, test_df = recording_level_split(manifest)
     train_device = torch.device(config.device if config and config.device != "auto" else "cpu")
     if config.verbose:
-        print(f"[train] split sizes train={len(train_df)} val={len(val_df)} test={len(test_df)}")
-        print(f"[train] feature device={train_device}")
+        print(f"[train] split sizes train={len(train_df)} val={len(val_df)} test={len(test_df)}", flush=True)
+        print(f"[train] feature device={train_device}", flush=True)
 
     train_sequences_by_label: Dict[str, List[np.ndarray]] = {}
     val_sequences_by_label: Dict[str, List[np.ndarray]] = {}
     test_sequences_by_label: Dict[str, List[np.ndarray]] = {}
     for label in CLASSES:
         if config.verbose:
-            print(f"[train] extracting features for {label}")
+            print(f"[train] extracting features for {label}", flush=True)
         label_t0 = time.perf_counter()
         train_sequences_by_label[label] = _load_sequences(train_df[train_df["label"] == label], device=train_device)
         val_sequences_by_label[label] = _load_sequences(val_df[val_df["label"] == label], device=train_device)
         test_sequences_by_label[label] = _load_sequences(test_df[test_df["label"] == label], device=train_device)
         if config.verbose:
             elapsed = time.perf_counter() - label_t0
-            print(f"[train] extracted {label} in {elapsed:.1f}s")
+            print(f"[train] extracted {label} in {elapsed:.1f}s", flush=True)
 
     if config.verbose:
-        print("[train] fitting scaler")
+        print("[train] fitting scaler", flush=True)
     scaler = _fit_scaler([seq for seqs in train_sequences_by_label.values() for seq in seqs])
     joblib.dump(scaler, output_dir / "feature_scaler.joblib")
 
     metrics = {"splits": {"train": len(train_df), "val": len(val_df), "test": len(test_df)}, "classes": {}}
     if config.verbose:
-        print("[train] fitting class models")
+        print("[train] fitting class models", flush=True)
     trained = Parallel(n_jobs=-1, prefer="threads")(
         delayed(_train_one_label)(
             label,
@@ -595,7 +608,7 @@ def train_hmm_suite(
     metrics_path = output_dir / "training_diagnostics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2))
     if config.verbose:
-        print(f"[train] total elapsed {time.perf_counter() - total_t0:.1f}s")
+        print(f"[train] total elapsed {time.perf_counter() - total_t0:.1f}s", flush=True)
     return metrics
 
 
