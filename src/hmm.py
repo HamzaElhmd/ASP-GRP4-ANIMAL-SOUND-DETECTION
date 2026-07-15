@@ -440,9 +440,13 @@ def _load_sequences(df: pd.DataFrame, device: torch.device = torch.device("cpu")
         batch_size = 64  # Increased batch size for more efficient GPU utilization
 
         def _load_audio_chunk(chunk: List[pd.Series]) -> List[torch.Tensor]:
-            return Parallel(n_jobs=-1, prefer="threads")(
-                delayed(_load_audio_tensor)(Path(row["filepath"]), TARGET_SR)[0] for row in chunk
+            # Run the parallel execution without indexing the delayed object
+            results = Parallel(n_jobs=-1, prefer="threads")(
+                delayed(_load_audio_tensor)(Path(row["filepath"]), TARGET_SR) for row in chunk
             )
+
+            # Extract the first item (the audio tensor) from each returned tuple
+            return [audio for audio, sr in results]
 
         sequences: List[np.ndarray] = []
         for start in range(0, len(rows), batch_size):
