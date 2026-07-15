@@ -122,6 +122,69 @@ def extract_mfcc_features_torch(
     return torch.cat([mfcc, delta, delta2], dim=1).contiguous()
 
 
+def _mfcc_frame_count(num_samples: int, win_length: int = 400, hop_length: int = 160) -> int:
+    if num_samples <= win_length:
+        return 1
+    return 1 + max(0, (num_samples - win_length) // hop_length)
+
+
+def _extract_mfcc_batch(
+    audio_batch: List[torch.Tensor],
+    sr: int = TARGET_SR,
+    device: torch.device = DEFAULT_DEVICE,
+    n_mfcc: int = 13,
+    n_fft: int = 512,
+    hop_length: int = 160,
+    win_length: int = 400,
+    n_mels: int = 26,
+) -> List[np.ndarray]:
+    if not audio_batch:
+        return []
+    batch = []
+    lengths = []
+    for audio in audio_batch:
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+        if audio.shape[0] != 1:
+            audio = audio.mean(dim=0, keepdim=True)
+        audio = audio.to(device=device, dtype=torch.float32)
+        lengths.append(audio.shape[1])
+        batch.append(audio)
+    max_len = max(lengths)
+    padded = torch.cat(
+        [torch.nn.functional.pad(audio, (0, max_len - audio.shape[1])) for audio in batch],
+        dim=0,
+    )
+    cache_key = (sr, n_mfcc, n_fft, hop_length, win_length, n_mels)
+    mfcc_transform = _MFCC_TRANSFORM_CACHE.get(cache_key)
+    if mfcc_transform is None or getattr(mfcc_transform, "_device", None) != device:
+        mfcc_transform = torchaudio.transforms.MFCC(
+            sample_rate=sr,
+            n_mfcc=n_mfcc,
+            melkwargs={
+                "n_fft": n_fft,
+                "hop_length": hop_length,
+                "win_length": win_length,
+                "n_mels": n_mels,
+                "center": False,
+                "power": 2.0,
+                "norm": "slaney",
+                "mel_scale": "htk",
+            },
+        ).to(device)
+        mfcc_transform._device = device  # type: ignore[attr-defined]
+        _MFCC_TRANSFORM_CACHE[cache_key] = mfcc_transform
+    mfcc = mfcc_transform(padded).transpose(1, 2)  # [B, T, F]
+    out = []
+    for i, length in enumerate(lengths):
+        n_frames = _mfcc_frame_count(length, win_length=win_length, hop_length=hop_length)
+        feat = mfcc[i, :n_frames]
+        delta = _delta_torch(feat)
+        delta2 = _delta_torch(delta)
+        out.append(torch.cat([feat, delta, delta2], dim=1).cpu().numpy().astype(np.float32))
+    return out
+
+
 def extract_mfcc_features(
     audio: np.ndarray,
     sr: int = TARGET_SR,
@@ -369,15 +432,30 @@ def _group_by_recording(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
 
 
 def _load_sequences(df: pd.DataFrame, device: torch.device = torch.device("cpu")) -> List[np.ndarray]:
+    rows = [row for _, row in df.iterrows()]
+    if not rows:
+        return []
+
+    if device.type == "cuda":
+        batch_size = 64  # Increased batch size for more efficient GPU utilization
+
+        def _load_audio_chunk(chunk: List[pd.Series]) -> List[torch.Tensor]:
+            return Parallel(n_jobs=-1, prefer="threads")(
+                delayed(_load_audio_tensor)(Path(row["filepath"]), TARGET_SR)[0] for row in chunk
+            )
+
+        sequences: List[np.ndarray] = []
+        for start in range(0, len(rows), batch_size):
+            chunk = rows[start : start + batch_size]
+            audio_batch = _load_audio_chunk(chunk)
+            sequences.extend(_extract_mfcc_batch(audio_batch, sr=TARGET_SR, device=device))
+        return sequences
+
+    # CPU path remains the same
     def _extract_row(row: pd.Series) -> np.ndarray:
         audio, sr = _load_audio_tensor(Path(row["filepath"]), TARGET_SR)
         return extract_mfcc_features_torch(audio, sr=sr, device=device).cpu().numpy().astype(np.float32)
 
-    rows = [row for _, row in df.iterrows()]
-    if not rows:
-        return []
-    if device.type == "cuda":
-        return [_extract_row(row) for row in rows]
     return Parallel(n_jobs=-1, prefer="threads")(delayed(_extract_row)(row) for row in rows)
 
 
@@ -562,36 +640,56 @@ def train_hmm_suite(
     config = config or BinaryHMMConfig()
     output_dir.mkdir(parents=True, exist_ok=True)
     total_t0 = time.perf_counter()
+
+    if config.verbose:
+        print(f"[train] using config: {config}", flush=True)
+
+    # Timers
+    t_manifest, t_split, t_features, t_scaler, t_model_fit = 0.0, 0.0, 0.0, 0.0, 0.0
+
+    # Load manifest
+    t0 = time.perf_counter()
     manifest = load_manifest(processed_root)
+    t_manifest = time.perf_counter() - t0
+
+    # Split data
+    t0 = time.perf_counter()
     train_df, val_df, test_df = recording_level_split(manifest)
+    t_split = time.perf_counter() - t0
+
     train_device = torch.device(config.device if config and config.device != "auto" else "cpu")
     if config.verbose:
         print(f"[train] split sizes train={len(train_df)} val={len(val_df)} test={len(test_df)}", flush=True)
         print(f"[train] feature device={train_device}", flush=True)
 
+    # Extract features
+    t0 = time.perf_counter()
     train_sequences_by_label: Dict[str, List[np.ndarray]] = {}
     val_sequences_by_label: Dict[str, List[np.ndarray]] = {}
     test_sequences_by_label: Dict[str, List[np.ndarray]] = {}
     for label in CLASSES:
         if config.verbose:
             print(f"[train] extracting features for {label}", flush=True)
-        label_t0 = time.perf_counter()
         train_sequences_by_label[label] = _load_sequences(train_df[train_df["label"] == label], device=train_device)
         val_sequences_by_label[label] = _load_sequences(val_df[val_df["label"] == label], device=train_device)
         test_sequences_by_label[label] = _load_sequences(test_df[test_df["label"] == label], device=train_device)
-        if config.verbose:
-            elapsed = time.perf_counter() - label_t0
-            print(f"[train] extracted {label} in {elapsed:.1f}s", flush=True)
+    t_features = time.perf_counter() - t0
 
+    # Fit scaler
+    t0 = time.perf_counter()
     if config.verbose:
         print("[train] fitting scaler", flush=True)
     scaler = _fit_scaler([seq for seqs in train_sequences_by_label.values() for seq in seqs])
     joblib.dump(scaler, output_dir / "feature_scaler.joblib")
+    t_scaler = time.perf_counter() - t0
 
+    # Fit models
+    t0 = time.perf_counter()
     metrics = {"splits": {"train": len(train_df), "val": len(val_df), "test": len(test_df)}, "classes": {}}
     if config.verbose:
         print("[train] fitting class models", flush=True)
     trained = Parallel(n_jobs=-1, prefer="threads")(
+
         delayed(_train_one_label)(
             label,
             train_sequences_by_label[label],
@@ -604,11 +702,22 @@ def train_hmm_suite(
         for label in CLASSES
     )
     metrics["classes"] = {label: values for label, values in trained}
+    t_model_fit = time.perf_counter() - t0
 
     metrics_path = output_dir / "training_diagnostics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2))
+    
+    total_elapsed = time.perf_counter() - total_t0
     if config.verbose:
-        print(f"[train] total elapsed {time.perf_counter() - total_t0:.1f}s", flush=True)
+        print(f"[train] total elapsed {total_elapsed:.1f}s", flush=True)
+        print("\n--- Timing Summary ---")
+        print(f"  Manifest loading: {t_manifest:.2f}s")
+        print(f"  Data splitting:   {t_split:.2f}s")
+        print(f"  Feature extraction: {t_features:.2f}s")
+        print(f"  Scaler fitting:     {t_scaler:.2f}s")
+        print(f"  Model fitting:      {t_model_fit:.2f}s")
+        print(f"  Total:              {total_elapsed:.2f}s")
+        print("--------------------\n")
     return metrics
 
 
@@ -619,10 +728,28 @@ def infer_continuous_file(
     median_width: int = 5,
     gap_fill_ms: int = 300,
     hop_seconds: float = FEATURE_HOP_SECONDS,
+    verbose: bool = False,
 ) -> List[Dict[str, str]]:
+    total_t0 = time.perf_counter()
+    if verbose:
+        print(f"[infer] processing {wav_path.name}", flush=True)
+
+    # Timers
+    t_load_models, t_load_audio, t_windowing, t_scoring, t_postprocess = 0.0, 0.0, 0.0, 0.0, 0.0
+
+    # Load models
+    t0 = time.perf_counter()
     scaler: StandardScaler = joblib.load(model_dir / "feature_scaler.joblib")
     models = {label: joblib.load(model_dir / f"{label}_hmm.joblib") for label in CLASSES}
+    t_load_models = time.perf_counter() - t0
+
+    # Load audio
+    t0 = time.perf_counter()
     audio_t, sr = _load_audio_tensor(wav_path, TARGET_SR)
+    t_load_audio = time.perf_counter() - t0
+
+    # Windowing
+    t0 = time.perf_counter()
     if torchaudio is None:
         raise RuntimeError("torchaudio is required for inference windowing")
     frames = inference_time_windowing(
@@ -632,6 +759,10 @@ def infer_continuous_file(
         hop_seconds=INFERENCE_HOP_SECONDS,
         window_function="hann",
     )
+    t_windowing = time.perf_counter() - t0
+
+    # Scoring
+    t0 = time.perf_counter()
     n_windows = frames.shape[0]
     total_frames = int(math.ceil(audio_t.shape[1] / sr / hop_seconds))
     probs = {label: np.zeros(total_frames, dtype=np.float32) for label in CLASSES}
@@ -652,9 +783,14 @@ def infer_continuous_file(
                     probs[label][frame_offset:end_frame],
                     active[: end_frame - frame_offset],
                 )
+    t_scoring = time.perf_counter() - t0
+
+    # Post-processing
+    t0 = time.perf_counter()
     outputs = []
     for label in CLASSES:
         active = temporal_postprocess(
+
             probs[label],
             threshold=threshold,
             median_width=median_width,
@@ -665,6 +801,20 @@ def infer_continuous_file(
             if end > start:
                 outputs.append({"event_start": f"{start:.3f}", "event_end": f"{end:.3f}", "animal": label})
     outputs.sort(key=lambda x: (float(x["event_start"]), x["animal"]))
+    t_postprocess = time.perf_counter() - t0
+
+    total_elapsed = time.perf_counter() - total_t0
+    if verbose:
+        print(f"[infer] total elapsed {total_elapsed:.1f}s", flush=True)
+        print("\n--- Timing Summary ---")
+        print(f"  Model loading:   {t_load_models:.2f}s")
+        print(f"  Audio loading:   {t_load_audio:.2f}s")
+        print(f"  Windowing:       {t_windowing:.2f}s")
+        print(f"  Scoring:         {t_scoring:.2f}s")
+        print(f"  Post-processing: {t_postprocess:.2f}s")
+        print(f"  Total:           {total_elapsed:.2f}s")
+        print("--------------------\n")
+
     return outputs
 
 
@@ -708,6 +858,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     train = sub.add_parser("train")
     train.add_argument("--processed-root", type=Path, default=Path("processed"))
     train.add_argument("--output-dir", type=Path, default=Path("artifacts/hmm"))
+    train.add_argument("--device", type=str, default="auto", help="Device to use for training (cpu, cuda, auto)")
+    train.add_argument("--n-iter", type=int, default=8, help="Number of training iterations")
+    train.add_argument("--n-components", type=int, default=2, help="Number of GMM components")
+    train.add_argument("--max-train-sequences", type=int, default=None, help="Cap the number of training sequences per class")
 
     eval_p = sub.add_parser("evaluate")
     eval_p.add_argument("--processed-root", type=Path, default=Path("processed"))
@@ -720,7 +874,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     infer.add_argument("--output", type=Path, default=Path("result_hmm.json"))
     infer.add_argument("--threshold", type=float, default=0.5)
     infer.add_argument("--median-width", type=int, default=5)
-    infer.add_argument("--gap-fill-frames", type=int, default=3)
+    infer.add_argument("--gap-fill-ms", type=int, default=300)
+    infer.add_argument("--verbose", action="store_true", help="Enable verbose output")
 
     return parser
 
@@ -729,7 +884,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
     if args.cmd == "train":
-        train_hmm_suite(args.processed_root, args.output_dir)
+        config = BinaryHMMConfig(
+            n_iter=args.n_iter,
+            n_components=args.n_components,
+            device=args.device,
+            verbose=True,
+            max_train_sequences_per_class=args.max_train_sequences,
+        )
+        train_hmm_suite(args.processed_root, args.output_dir, config=config)
     elif args.cmd == "evaluate":
         evaluate_suite(args.model_dir, args.processed_root, args.output_json)
     elif args.cmd == "infer":
@@ -738,7 +900,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             args.model_dir,
             threshold=args.threshold,
             median_width=args.median_width,
-            gap_fill_frames=args.gap_fill_frames,
+            gap_fill_ms=args.gap_fill_ms,
+            verbose=args.verbose,
         )
         save_inference_json(events, args.output)
 
