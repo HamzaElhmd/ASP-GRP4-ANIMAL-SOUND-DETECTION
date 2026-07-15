@@ -1,4 +1,0 @@
-samples: 1200, feature dim: 26
-K-Means: ARI=0.0397 NMI=0.0735 purity=0.2992
-GMM:     ARI=0.0410 NMI=0.0678 purity=0.2925
-PCA 2-component explained variance ratio: 0.4194
