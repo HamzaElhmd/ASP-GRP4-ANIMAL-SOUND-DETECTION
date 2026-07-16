@@ -1,6 +1,7 @@
 """Streamlit webapp for YAMNet animal sound detection with file upload."""
 
 import os
+import json # NEW: Import json for the download button
 from pathlib import Path
 
 import streamlit as st
@@ -27,14 +28,11 @@ def get_model():
 @st.cache_data
 def get_predictions(wav_path: str):
     model = get_model()
-    # Read the audio and check the sample rate first
     waveform, sr = torchaudio.load(wav_path)
     
-    # NEW: Automatically resample to 16000Hz if needed
     if sr != 16000:
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
         waveform = resampler(waveform)
-        # Save the resampled audio back to the temp path so YAMNet can read it
         torchaudio.save(wav_path, waveform, 16000)
         
     timestamps, probs = predict_continuous(wav_path, model)
@@ -44,7 +42,6 @@ def get_predictions(wav_path: str):
 def get_activity_mask(wav_path: str, timestamps: tuple):
     waveform, sr = torchaudio.load(wav_path)
     
-    # NEW: Automatically resample to 16000Hz if needed
     if sr != 16000:
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
         waveform = resampler(waveform)
@@ -91,8 +88,16 @@ def build_segments(timestamps, scores, activity_mask, sensitivity: float, min_du
         prev_t = t
     segments.append((seg_start_t, prev_t + HOP_SECONDS, seg_label))
 
-    # Filter by duration and drop unknowns
-    return [s for s in segments if s[1] - s[0] >= min_duration and s[2] != "unknown"]
+    # Return as a list of dicts mapped to the exact JSON schema requested
+    results = []
+    for s in segments:
+        if s[1] - s[0] >= min_duration and s[2] != "unknown":
+            results.append({
+                "event_start": f"{s[0]:.3f}", 
+                "event_end": f"{s[1]:.3f}", 
+                "animal": s[2]
+            })
+    return results
 
 # --- Sidebar UI ---
 st.sidebar.header("Detection Settings")
@@ -106,12 +111,10 @@ min_duration = st.sidebar.slider("Minimum segment duration (s)", 0.0, 3.0, 0.0, 
 uploaded_file = st.file_uploader("Upload an audio file (.wav)", type=["wav"])
 
 if uploaded_file is not None:
-    # Save to temp file for torchaudio and audix to read
     temp_wav_path = "temp_upload.wav"
     with open(temp_wav_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    # Audio Playback
     playback_state = audix(temp_wav_path, key="audix_player")
     current_time = playback_state.get("currentTime", 0.0) if playback_state else 0.0
     is_playing = bool(playback_state and playback_state.get("isPlaying"))
@@ -130,10 +133,11 @@ if uploaded_file is not None:
         if not is_playing and current_time == 0.0:
             st.info("Press play to reveal detections in real-time.")
         
-        revealed = [s for s in all_segments if s[0] <= current_time]
+        # Check against float("event_start") since we formatted it as a string earlier
+        revealed = [s for s in all_segments if float(s["event_start"]) <= current_time]
         if revealed:
-            for start, end, label in revealed:
-                st.write(f"🔉 **{start:05.2f}s - {end:05.2f}s**  →  🐾 **{label}**")
+            for seg in revealed:
+                st.write(f"🔉 **{float(seg['event_start']):05.2f}s - {float(seg['event_end']):05.2f}s**  →  🐾 **{seg['animal']}**")
         else:
             st.write("Nothing detected yet at this point in playback.")
             
@@ -144,8 +148,17 @@ if uploaded_file is not None:
         st.subheader("All Detected Segments")
         if all_segments:
             # Format data for the dataframe
-            formatted_segments = [{"Start (s)": f"{s[0]:.2f}", "End (s)": f"{s[1]:.2f}", "Animal": s[2].capitalize()} for s in all_segments]
+            formatted_segments = [{"Start (s)": s["event_start"], "End (s)": s["event_end"], "Animal": s["animal"].capitalize()} for s in all_segments]
             st.dataframe(formatted_segments, use_container_width=True)
+            
+            # NEW: Download Button
+            json_string = json.dumps(all_segments, indent=2)
+            st.download_button(
+                label="📥 Download JSON Results",
+                data=json_string,
+                file_name=f"{Path(uploaded_file.name).stem}_inference.json",
+                mime="application/json"
+            )
         else:
             st.success("No animals detected in this audio file.")
 
