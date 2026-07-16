@@ -1,13 +1,15 @@
 """Streamlit webapp for YAMNet animal sound detection with file upload."""
 
 import os
-import json # NEW: Import json for the download button
+import json
 from pathlib import Path
 
 import streamlit as st
 import torch
 import torchaudio
 from streamlit_advanced_audio import audix
+import matplotlib.pyplot as plt
+import numpy as np
 
 from src.evaluate_yamnet import load_trained_model
 from src.yamnet_data import ANIMAL_CLASSES
@@ -64,40 +66,89 @@ def get_activity_mask(wav_path: str, timestamps: tuple):
 
 
 def build_segments(timestamps, scores, activity_mask, sensitivity: float, min_duration: float):
-    entries = []
-    for t, row, active in zip(timestamps, scores, activity_mask):
-        if not active:
-            continue
-        best_idx = row.argmax()
-        best_class = ANIMAL_CLASSES[best_idx]
-        class_threshold = CALIBRATED_THRESHOLDS[best_class] * sensitivity
-        label = best_class if row[best_idx] >= class_threshold else "unknown"
-        entries.append((t, label))
+    """Builds a list of events from model outputs, supporting overlapping events."""
+    all_events = []
+    for i, animal in enumerate(ANIMAL_CLASSES):
+        class_threshold = CALIBRATED_THRESHOLDS[animal] * sensitivity
+        
+        in_event = False
+        start_time = 0
+        
+        for t, score, active in zip(timestamps, scores[:, i], activity_mask):
+            if not active:
+                if in_event:
+                    # End of event due to inactivity
+                    if t - start_time >= min_duration:
+                        all_events.append({
+                            "event_start": f"{start_time:.3f}",
+                            "event_end": f"{t:.3f}",
+                            "animal": animal
+                        })
+                    in_event = False
+                continue
 
-    if not entries:
-        return []
+            above_threshold = score >= class_threshold
+            
+            if above_threshold and not in_event:
+                # Start of a new event
+                in_event = True
+                start_time = t
+            elif not above_threshold and in_event:
+                # End of an event
+                if t - start_time >= min_duration:
+                    all_events.append({
+                        "event_start": f"{start_time:.3f}",
+                        "event_end": f"{t:.3f}",
+                        "animal": animal
+                    })
+                in_event = False
+        
+        # After loop, handle event that extends to the end
+        if in_event:
+            end_time = timestamps[-1]
+            if end_time - start_time >= min_duration:
+                all_events.append({
+                    "event_start": f"{start_time:.3f}",
+                    "event_end": f"{end_time:.3f}",
+                    "animal": animal
+                })
 
-    segments = []
-    seg_start_t, seg_label = entries[0]
-    prev_t = entries[0][0]
-    for t, label in entries[1:]:
-        gap = t - prev_t
-        if label != seg_label or gap > HOP_SECONDS * 1.5:
-            segments.append((seg_start_t, prev_t + HOP_SECONDS, seg_label))
-            seg_start_t, seg_label = t, label
-        prev_t = t
-    segments.append((seg_start_t, prev_t + HOP_SECONDS, seg_label))
+    # Sort events by start time for a chronological log
+    all_events.sort(key=lambda x: float(x['event_start']))
+    
+    return all_events
 
-    # Return as a list of dicts mapped to the exact JSON schema requested
-    results = []
-    for s in segments:
-        if s[1] - s[0] >= min_duration and s[2] != "unknown":
-            results.append({
-                "event_start": f"{s[0]:.3f}", 
-                "event_end": f"{s[1]:.3f}", 
-                "animal": s[2]
-            })
-    return results
+def plot_waveform_with_segments(waveform_data, sr, segments):
+    """Plots the waveform and overlays detected event segments."""
+    fig, ax = plt.subplots(figsize=(16, 4))
+    
+    time_axis = np.arange(len(waveform_data)) / sr
+    ax.plot(time_axis, waveform_data, color='gray', alpha=0.8, linewidth=0.7)
+
+    class_colors = {
+        "cat": "#1f77b4", "cow": "#ff7f0e", "dog": "#2ca02c", 
+        "rooster": "#d62728", "sheep": "#9467bd"
+    }
+    
+    for seg in segments:
+        start_time = float(seg["event_start"])
+        end_time = float(seg["event_end"])
+        animal = seg["animal"]
+        color = class_colors.get(animal, "k")
+        
+        ax.axvspan(start_time, end_time, color=color, alpha=0.3)
+        
+        y_max = ax.get_ylim()[1]
+        ax.text(start_time + 0.05, y_max * 0.9, animal, fontsize=9, color=color, weight='bold')
+
+    ax.set_title("Waveform with Detected Segments")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Amplitude")
+    ax.set_xlim(0, time_axis[-1])
+    ax.grid(True, linestyle='--', alpha=0.6)
+    fig.tight_layout()
+    
+    return fig
 
 # --- Sidebar UI ---
 st.sidebar.header("Detection Settings")
@@ -133,7 +184,6 @@ if uploaded_file is not None:
         if not is_playing and current_time == 0.0:
             st.info("Press play to reveal detections in real-time.")
         
-        # Check against float("event_start") since we formatted it as a string earlier
         revealed = [s for s in all_segments if float(s["event_start"]) <= current_time]
         if revealed:
             for seg in revealed:
@@ -147,11 +197,9 @@ if uploaded_file is not None:
     with col2:
         st.subheader("All Detected Segments")
         if all_segments:
-            # Format data for the dataframe
             formatted_segments = [{"Start (s)": s["event_start"], "End (s)": s["event_end"], "Animal": s["animal"].capitalize()} for s in all_segments]
             st.dataframe(formatted_segments, use_container_width=True)
             
-            # NEW: Download Button
             json_string = json.dumps(all_segments, indent=2)
             st.download_button(
                 label="📥 Download JSON Results",
@@ -159,6 +207,29 @@ if uploaded_file is not None:
                 file_name=f"{Path(uploaded_file.name).stem}_inference.json",
                 mime="application/json"
             )
+
+            waveform, sr = torchaudio.load(temp_wav_path)
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+            st.subheader("Waveform with Detections")
+            fig = plot_waveform_with_segments(waveform.squeeze().numpy(), sr, all_segments)
+            st.pyplot(fig)
+            
+            st.subheader("Play Detected Segments")
+            with st.expander("Show/Hide Individual Segment Players"):
+                for seg in all_segments:
+                    animal = seg['animal']
+                    start_s = float(seg['event_start'])
+                    end_s = float(seg['event_end'])
+
+                    st.markdown(f"**{animal.capitalize()}** (`{start_s:.2f}s` - `{end_s:.2f}s`)")
+
+                    start_sample = int(start_s * sr)
+                    end_sample = int(end_s * sr)
+                    audio_segment = waveform[:, start_sample:end_sample]
+                    
+                    st.audio(audio_segment.numpy(), sample_rate=sr)
         else:
             st.success("No animals detected in this audio file.")
 
